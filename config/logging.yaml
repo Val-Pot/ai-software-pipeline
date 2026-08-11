@@ -1,0 +1,71 @@
+version: 1
+disable_existing_loggers: false
+
+formatters:
+  standard:
+    format: "%(asctime)s [%(levelname)-8s] %(name)s: %(message)s"
+    datefmt: "%Y-%m-%dT%H:%M:%SZ"
+
+  json:
+    "()": pythonjsonlogger.jsonlogger.JsonFormatter
+    format: "%(asctime)s %(levelname)s %(name)s %(funcName)s %(message)s"
+
+handlers:
+  console:
+    class: logging.StreamHandler
+    level: DEBUG
+    formatter: standard
+    stream: ext://sys.stdout
+
+root:
+  level: INFO
+  handlers: [console]
+
+loggers:
+  # Silence overly verbose third-party loggers
+  uvicorn.access:
+    level: WARNING
+    propagate: false
+    handlers: [console]
+
+  uvicorn.error:
+    level: INFO
+    propagate: false
+    handlers: [console]
+
+  aiogram:
+    level: INFO
+    propagate: true
+
+  aiogram.event:
+    level: WARNING   # suppress per-update noise in development
+    propagate: true
+
+  httpx:
+    level: WARNING
+    propagate: true
+
+  # Project namespaces — verbose in development, tuned via LOG_LEVEL env var
+  app:
+    level: DEBUG
+    propagate: true
+
+  adapters:
+    level: DEBUG
+    propagate: true
+
+  orchestrator:
+    level: DEBUG
+    propagate: true
+
+  telegram_bot:
+    level: DEBUG
+    propagate: true
+
+  github:
+    level: DEBUG
+    propagate: true
+
+  webhooks:
+    level: DEBUG
+    propagate: true

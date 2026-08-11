@@ -1,0 +1,71 @@
+# ==============================================================================
+# AI Software Pipeline — Docker Compose
+# Local development environment
+# ==============================================================================
+
+services:
+
+  # ── Main Application ────────────────────────────────────────────────────────
+  pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: ai-pipeline-app
+    restart: unless-stopped
+
+    # Load all env vars from .env file (never committed to VCS)
+    env_file:
+      - .env
+
+    # Override env vars for containerised networking
+    environment:
+      # Bind to all interfaces inside the container
+      HOST: "0.0.0.0"
+      PORT: "8000"
+      # In local dev, long-polling is simpler than webhook
+      TELEGRAM_USE_WEBHOOK: "false"
+      # Python won't buffer stdout — required for live log streaming
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    ports:
+      - "8000:8000"
+
+    volumes:
+      # Mount source code for hot-reload in development
+      # Remove this in production deployments
+      - .:/app:ro
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── (Optional) Redis — reserved for future persistence layer ───────────────
+  # Uncomment to swap InMemoryPersistenceAdapter for a Redis-backed one.
+  #
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: ai-pipeline-redis
+  #   restart: unless-stopped
+  #   ports:
+  #     - "6379:6379"
+  #   volumes:
+  #     - redis_data:/data
+  #   healthcheck:
+  #     test: ["CMD", "redis-cli", "ping"]
+  #     interval: 10s
+  #     timeout: 3s
+  #     retries: 3
+
+# volumes:
+#   redis_data:
