@@ -48,10 +48,15 @@ class Settings(BaseSettings):
     github_repo: str = ""
     github_webhook_secret: str = ""
 
+    #: Comma-separated GitHub Actions workflow names that count as CI.
+    #: Empty = any completed workflow with success/failure/timed_out.
+    github_ci_workflow_name: str = ""
+
     # ------------------------------------------------------------------
     # Coding Agent (GitHub Copilot)
     # ------------------------------------------------------------------
-    #: GitHub login of the Copilot coding agent bot.
+    #: GitHub login used to detect Copilot comments (github-copilot[bot]).
+    #: Assignment uses copilot-swe-agent[bot] regardless of this value.
     copilot_username: str = "github-copilot[bot]"
 
     #: Seconds between polling iterations when watching an issue.
@@ -113,6 +118,17 @@ class Settings(BaseSettings):
             elif token:
                 logger.warning("Skipping invalid user ID in TELEGRAM_ALLOWED_USER_IDS: %r", token)
         return frozenset(ids)
+
+    @property
+    def ci_workflow_names(self) -> FrozenSet[str]:
+        """Lowercased GitHub Actions workflow names treated as pipeline CI."""
+        if not self.github_ci_workflow_name.strip():
+            return frozenset()
+        return frozenset(
+            name.strip().lower()
+            for name in self.github_ci_workflow_name.split(",")
+            if name.strip()
+        )
 
     @property
     def telegram_webhook_full_url(self) -> str:

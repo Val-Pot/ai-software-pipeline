@@ -18,8 +18,19 @@ from pydantic import BaseModel
 
 from adapters.coding_agent.adapter import CodingAgentAdapter
 from adapters.coding_agent.models import AgentEventType
-from adapters.github.webhooks import GitHubWebhookParser, GitHubWebhookVerifier, WebhookVerificationError
-from app.dependencies import get_coding_agent_adapter, get_pipeline_runner, get_webhook_verifier
+from adapters.github.webhooks import (
+    GitHubWebhookParser,
+    GitHubWebhookVerifier,
+    WebhookVerificationError,
+    extract_github_event_refs,
+    parse_webhook_payload,
+)
+from app.dependencies import (
+    get_coding_agent_adapter,
+    get_pipeline_runner,
+    get_webhook_verifier,
+)
+from config.settings import get_settings
 from orchestrator.pipeline_runner import PipelineRunner
 
 logger = logging.getLogger(__name__)
@@ -95,9 +106,9 @@ async def receive_github_webhook(
             detail="Invalid HMAC SHA-256 webhook signature.",
         ) from exc
 
-    # ---- 2. Parse JSON payload -------------------------------------------
+    # ---- 2. Parse JSON payload from the already-read body ----------------
     try:
-        payload: dict = await request.json()
+        payload: dict = parse_webhook_payload(body)
     except Exception as exc:
         logger.error(
             "Failed to parse JSON body for delivery_id=%s: %s",
@@ -110,9 +121,8 @@ async def receive_github_webhook(
         ) from exc
 
     # ---- 3. Attempt CodingAgentAdapter parsing (agent lifecycle) ---------
-    #         The job_id may be embedded in the payload (added by the pipeline
-    #         when it posts comments), otherwise fall back to "active_job".
-    job_id: str = payload.get("job_id") or "active_job"
+    refs = extract_github_event_refs(payload)
+    job_id: str = refs.get("job_id") or ""
 
     if coding_agent is not None:
         agent_event = coding_agent.parse_webhook_event(x_github_event, payload, job_id=job_id)
@@ -127,8 +137,9 @@ async def receive_github_webhook(
             orchestrator_event_type = _agent_event_to_orchestrator_type(agent_event.event_type)
             if orchestrator_event_type:
                 orchestrator_payload = {
-                    "pr_number": agent_event.pr_number,
+                    "pr_number": agent_event.pr_number or refs.get("pr_number"),
                     "pr_url": agent_event.pr_url,
+                    "issue_number": agent_event.issue_number or refs.get("issue_number"),
                     "question": agent_event.question,
                     "comment_id": agent_event.comment_id,
                     "message": agent_event.message,
@@ -161,7 +172,12 @@ async def receive_github_webhook(
             )
 
     # ---- 4. Fallback: legacy GitHubWebhookParser (CI/PR events) ----------
-    parsed_event = GitHubWebhookParser.parse_event(x_github_event, payload)
+    settings = getattr(request.app.state, "settings", None) or get_settings()
+    parsed_event = GitHubWebhookParser.parse_event(
+        x_github_event,
+        payload,
+        ci_workflow_names=settings.ci_workflow_names,
+    )
     if not parsed_event:
         logger.info(
             "Unhandled GitHub event=%s delivery_id=%s — ignored.",

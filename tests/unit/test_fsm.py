@@ -118,3 +118,62 @@ async def test_retry_limit_exceeded(runner, notifier):
     job2 = await runner.persistence.load_job(job.job_id)
     assert job2.state == PipelineState.FAILED
     assert "Max retries" in job2.error
+
+
+async def _store_with_issue(runner: PipelineRunner, job: PipelineJob, issue_number: int) -> PipelineJob:
+    stored = await runner.persistence.load_job(job.job_id)
+    assert stored is not None
+    updated = stored.model_copy(update={"issue_number": issue_number})
+    await runner.persistence.save_job(updated)
+    return updated
+
+
+@pytest.mark.asyncio
+async def test_process_event_resolves_job_by_issue_number(runner):
+    job = await runner.create_and_start_job(100, 200, "user", "Task A")
+    await _store_with_issue(runner, job, 7)
+
+    ok = await runner.process_event(
+        job_id="",
+        event_id="evt_pr_no_id",
+        event_type="pr_opened",
+        payload={"pr_url": "https://github.com/pr/9", "pr_number": 9, "issue_number": 7},
+    )
+    assert ok is True
+    updated = await runner.persistence.load_job(job.job_id)
+    assert updated.state == PipelineState.WAIT_TESTS
+    assert updated.pr_number == 9
+
+
+@pytest.mark.asyncio
+async def test_process_event_picks_matching_job_among_several(runner):
+    job_a = await runner.create_and_start_job(1, 1, "a", "A")
+    job_b = await runner.create_and_start_job(2, 2, "b", "B")
+    await _store_with_issue(runner, job_a, 10)
+    await _store_with_issue(runner, job_b, 20)
+
+    ok = await runner.process_event(
+        "",
+        "evt_b",
+        "pr_opened",
+        {"pr_number": 21, "pr_url": "https://github.com/pr/21", "issue_number": 20},
+    )
+    assert ok is True
+    assert (await runner.persistence.load_job(job_a.job_id)).state == PipelineState.CODING_AGENT_RUNNING
+    assert (await runner.persistence.load_job(job_b.job_id)).state == PipelineState.WAIT_TESTS
+
+
+@pytest.mark.asyncio
+async def test_process_event_resolves_sole_active_job_without_refs(runner):
+    job = await runner.create_and_start_job(100, 200, "user", "Only job")
+
+    ok = await runner.process_event(
+        "active_job",
+        "evt_pr",
+        "pr_opened",
+        {"pr_url": "https://github.com/pr/1", "pr_number": 1},
+    )
+    assert ok is True
+    updated = await runner.persistence.load_job(job.job_id)
+    assert updated.state == PipelineState.WAIT_TESTS
+    assert updated.pr_number == 1

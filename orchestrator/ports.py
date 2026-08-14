@@ -45,6 +45,15 @@ class PersistencePort(Protocol):
         """Load all active (non-terminal) pipeline jobs for restart recovery."""
         ...
 
+    async def find_active_job_by_github_refs(
+        self,
+        *,
+        issue_number: Optional[int] = None,
+        pr_number: Optional[int] = None,
+    ) -> Optional[PipelineJob]:
+        """Resolve an active job from GitHub issue/PR numbers when webhook has no job_id."""
+        ...
+
 
 @runtime_checkable
 class NotifierPort(Protocol):

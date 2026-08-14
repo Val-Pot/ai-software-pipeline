@@ -34,6 +34,7 @@ from fastapi import FastAPI
 from adapters.coding_agent.adapter import CodingAgentAdapter
 from adapters.github.adapter import GitHubAdapter
 from adapters.github.client import GitHubHTTPClient
+from adapters.github.webhooks import REQUIRED_WEBHOOK_EVENTS
 from adapters.telegram.client import TelegramBotClient
 from adapters.telegram.notifier import TelegramNotifier
 from config.logging_setup import configure_logging
@@ -99,6 +100,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             settings.github_owner,
             settings.github_repo,
         )
+        logger.info(
+            "Configure the GitHub repo webhook for %s/%s → POST /webhooks/github "
+            "(application/json) with events: %s",
+            settings.github_owner,
+            settings.github_repo,
+            ", ".join(REQUIRED_WEBHOOK_EVENTS),
+        )
+        if settings.ci_workflow_names:
+            logger.info(
+                "CI workflow filter enabled: %s",
+                ", ".join(sorted(settings.ci_workflow_names)),
+            )
     else:
         logger.warning(
             "GitHub credentials not fully configured — GitHubAdapter disabled. "

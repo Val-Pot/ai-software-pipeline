@@ -44,8 +44,23 @@ cp .env.example .env
 - `GITHUB_OWNER`: Имя владельца репозитория.
 - `GITHUB_REPO`: Имя репозитория.
 - `GITHUB_WEBHOOK_SECRET`: Секретный ключ HMAC вебхуков.
+- `GITHUB_CI_WORKFLOW_NAME`: (опционально) имя workflow GitHub Actions, которое считается CI. Пустое значение — любой success/failure.
 
-### 2. Запуск через Docker Compose
+### 2. GitHub webhook
+
+Репозиторий должен слать webhook на публичный URL сервиса:
+
+`POST https://<host>:8000/webhooks/github`
+
+Обязательные настройки:
+
+- **Content type:** `application/json`
+- **Secret:** тот же, что `GITHUB_WEBHOOK_SECRET`
+- **Events:** `pull_request`, `workflow_run`, `issue_comment`
+
+Локально нужен туннель (ngrok, Cloudflare Tunnel и т.п.) на порт `8000`. События `issues` / `label` пайплайн игнорирует — их недостаточно.
+
+### 3. Запуск через Docker Compose
 
 ```bash
 docker compose up --build

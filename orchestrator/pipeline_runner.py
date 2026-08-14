@@ -16,6 +16,16 @@ from orchestrator.ports import GitHubPort, NotifierPort, PersistencePort
 
 logger = logging.getLogger(__name__)
 
+_SENTINEL_JOB_IDS = {"", "active_job", "n/a", "unresolved"}
+
+
+def _optional_int(value: object) -> Optional[int]:
+    try:
+        number = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
 
 class PipelineRunner:
     """
@@ -103,9 +113,14 @@ class PipelineRunner:
         """
         Idempotent event consumer for external webhooks / user actions.
         """
-        job = await self.persistence.load_job(job_id)
+        job = await self._resolve_job(job_id, payload)
         if not job or job.is_terminal:
-            logger.warning("Received event for missing or terminal job_id=%s", job_id)
+            logger.warning(
+                "Received event for missing or terminal job job_id=%s issue=%s pr=%s",
+                job_id or "-",
+                payload.get("issue_number"),
+                payload.get("pr_number"),
+            )
             return False
 
         # Idempotency check
@@ -140,6 +155,29 @@ class PipelineRunner:
                 await self.notifier.ask_question(job.chat_id, job.job_id, question)
 
         return True
+
+    async def _resolve_job(self, job_id: str, payload: Dict) -> Optional[PipelineJob]:
+        """Find the pipeline job for a webhook: explicit job_id, then GitHub issue/PR refs."""
+        if job_id and job_id.strip().lower() not in _SENTINEL_JOB_IDS:
+            job = await self.persistence.load_job(job_id)
+            if job is not None:
+                return job
+            logger.info("job_id=%s not found, falling back to GitHub issue/PR refs", job_id)
+
+        issue_number = _optional_int(payload.get("issue_number"))
+        pr_number = _optional_int(payload.get("pr_number"))
+        job = await self.persistence.find_active_job_by_github_refs(
+            issue_number=issue_number,
+            pr_number=pr_number,
+        )
+        if job is not None:
+            logger.info(
+                "Resolved webhook to job_id=%s via GitHub refs issue=%s pr=%s",
+                job.short_id,
+                issue_number,
+                pr_number,
+            )
+        return job
 
     async def cancel_job(self, job_id: str) -> bool:
         """Cancel pipeline job."""
