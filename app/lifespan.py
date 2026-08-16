@@ -132,9 +132,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             request_timeout=settings.coding_agent_request_timeout,
         )
         logger.info(
-            "CodingAgentAdapter initialised: agent=%s poll_interval=%.1fs",
+            "CodingAgentAdapter initialised: agent=%s poll_interval=%.1fs watcher_timeout=%.0fs",
             settings.copilot_username,
             settings.coding_agent_poll_interval,
+            settings.coding_agent_watcher_timeout,
         )
     else:
         logger.warning("CodingAgentAdapter disabled — GitHub client unavailable.")
@@ -152,8 +153,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         persistence=persistence,
         github=github_adapter,         # may be None in dev without GitHub creds
         notifier=None,                 # injected below after Telegram is ready
+        issue_watcher=coding_agent_adapter,
         max_retries=settings.coding_agent_max_retries,
         enable_ai_review=True,
+        watcher_timeout=settings.coding_agent_watcher_timeout,
     )
     logger.info("PipelineRunner (Orchestrator) initialised.")
 
@@ -228,6 +231,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # 16. Graceful shutdown
     # ------------------------------------------------------------------
     logger.info("=== AI Software Pipeline shutting down ===")
+
+    await orchestrator_runner.shutdown_watchers()
 
     # Cancel long-polling task
     if polling_task and not polling_task.done():

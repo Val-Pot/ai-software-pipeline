@@ -4,7 +4,7 @@ Includes GitHubPort, NotifierPort, and PersistencePort.
 """
 from __future__ import annotations
 
-from typing import Protocol, Optional, List, runtime_checkable
+from typing import Any, AsyncIterator, Optional, Protocol, List, runtime_checkable
 from orchestrator.context import PipelineJob
 
 
@@ -26,6 +26,29 @@ class GitHubPort(Protocol):
 
     async def run_ai_review(self, job: PipelineJob) -> bool:
         """Post AI review on Pull Request."""
+        ...
+
+
+@runtime_checkable
+class IssueWatcherPort(Protocol):
+    """Optional polling fallback when GitHub webhooks do not arrive."""
+
+    def watch_issue(
+        self,
+        issue_number: int,
+        job_id: Optional[str] = None,
+        timeout: float = 3600.0,
+    ) -> AsyncIterator[Any]:
+        """Yield coding-agent lifecycle events for an issue."""
+        ...
+
+    async def send_user_reply(
+        self,
+        issue_number: int,
+        reply_text: str,
+        job_id: Optional[str] = None,
+    ) -> Any:
+        """Post the user's Telegram answer as an issue comment."""
         ...
 
 

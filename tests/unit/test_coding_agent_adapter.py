@@ -18,6 +18,7 @@ Strategy:
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -209,6 +210,7 @@ async def test_send_user_reply_success(adapter: CodingAgentAdapter) -> None:
 
     assert event.comment_id == 50
     assert event.issue_number == 11
+    assert event.event_type == AgentEventType.USER_REPLY
     adapter._issues.add_comment.assert_awaited_once_with(11, "Please use OAuth2.")
 
 
@@ -264,6 +266,34 @@ async def test_detect_pull_request_from_pr_list(
 
     assert event is not None
     assert event.pr_number == 88
+    mock_client.get.assert_awaited()
+    assert mock_client.get.await_args.kwargs["params"]["state"] == "all"
+
+
+@pytest.mark.asyncio
+async def test_detect_pull_request_from_merged_pr_list(
+    adapter: CodingAgentAdapter, mock_client: MagicMock
+) -> None:
+    adapter._issues.get_comments = AsyncMock(return_value=[])
+    mock_client.get = AsyncMock(
+        return_value=[
+            {
+                "number": 91,
+                "html_url": "https://github.com/owner/repo/pull/91",
+                "title": "Implement task",
+                "body": "Fixes #5",
+                "state": "closed",
+                "merged_at": "2026-08-16T12:00:00Z",
+                "user": {"login": "github-copilot[bot]", "id": 99, "type": "Bot"},
+            }
+        ]
+    )
+
+    event = await adapter.detect_pull_request(issue_number=5)
+
+    assert event is not None
+    assert event.pr_number == 91
+    assert event.pr_url == "https://github.com/owner/repo/pull/91"
 
 
 @pytest.mark.asyncio
@@ -492,3 +522,87 @@ def test_parse_webhook_non_copilot_comment_ignored(adapter: CodingAgentAdapter) 
     event = adapter.parse_webhook_event("issue_comment", payload)
 
     assert event is None
+
+
+@pytest.mark.asyncio
+async def test_watch_issue_detects_pr_after_question(adapter: CodingAgentAdapter) -> None:
+    start = CodingAgentEvent(
+        event_type=AgentEventType.AGENT_STARTED,
+        issue_number=1,
+        comment_id=1,
+        message="started",
+    )
+    question = CodingAgentEvent(
+        event_type=AgentEventType.COPILOT_QUESTION,
+        issue_number=1,
+        comment_id=2,
+        question="Which auth library?",
+        message="question",
+    )
+    pr = CodingAgentEvent(
+        event_type=AgentEventType.PR_CREATED,
+        issue_number=1,
+        pr_number=9,
+        pr_url="https://github.com/owner/repo/pull/9",
+        message="pr",
+    )
+    adapter.detect_agent_start = AsyncMock(return_value=start)
+    adapter.detect_copilot_question = AsyncMock(return_value=question)
+    adapter.detect_pull_request = AsyncMock(return_value=pr)
+    adapter.detect_task_completion = AsyncMock(return_value=None)
+
+    seen: list[AgentEventType] = []
+    async for event in adapter.watch_issue(1, timeout=1.0):
+        seen.append(event.event_type)
+        if event.event_type == AgentEventType.PR_CREATED:
+            break
+
+    assert AgentEventType.COPILOT_QUESTION in seen
+    assert AgentEventType.PR_CREATED in seen
+    adapter.detect_pull_request.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_watch_issue_idle_timeout(adapter: CodingAgentAdapter) -> None:
+    adapter.detect_agent_start = AsyncMock(return_value=None)
+    adapter.detect_copilot_question = AsyncMock(return_value=None)
+    adapter.detect_pull_request = AsyncMock(return_value=None)
+    adapter.detect_task_completion = AsyncMock(return_value=None)
+
+    events = [event async for event in adapter.watch_issue(1, timeout=0.05)]
+
+    assert events
+    assert events[-1].event_type == AgentEventType.ADAPTER_ERROR
+    assert "No news from GitHub" in (events[-1].message or "")
+
+
+@pytest.mark.asyncio
+async def test_send_user_reply_notes_watcher_activity(adapter: CodingAgentAdapter) -> None:
+    adapter._issues.add_comment = AsyncMock(
+        return_value=_make_comment(50, "Please use OAuth2.", "human-user")
+    )
+
+    await adapter.send_user_reply(11, "Please use OAuth2.")
+
+    assert 11 in adapter._watcher_activity
+
+
+@pytest.mark.asyncio
+async def test_watch_issue_idle_clock_honors_activity_bump(adapter: CodingAgentAdapter) -> None:
+    adapter.detect_agent_start = AsyncMock(return_value=None)
+    adapter.detect_copilot_question = AsyncMock(return_value=None)
+    adapter.detect_pull_request = AsyncMock(return_value=None)
+    adapter.detect_task_completion = AsyncMock(return_value=None)
+
+    async def expire_after_bump() -> None:
+        await asyncio.sleep(0.02)
+        adapter.note_watcher_activity(1)
+        await asyncio.sleep(0.02)
+        adapter._watcher_activity[1] = asyncio.get_running_loop().time() - 100
+
+    bump_task = asyncio.create_task(expire_after_bump())
+    events = [event async for event in adapter.watch_issue(1, timeout=1.0)]
+    await bump_task
+
+    assert events
+    assert events[-1].event_type == AgentEventType.ADAPTER_ERROR

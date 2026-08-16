@@ -125,6 +125,7 @@ class CodingAgentAdapter:
 
         self._issues = GitHubIssueAdapter(client)
         self._pull_requests = GitHubPullRequestAdapter(client)
+        self._watcher_activity: dict[int, float] = {}
 
         logger.debug(
             "CodingAgentAdapter initialised: agent=%s max_retries=%d poll_interval=%.1fs",
@@ -132,6 +133,14 @@ class CodingAgentAdapter:
             max_retries,
             poll_interval,
         )
+
+    def note_watcher_activity(self, issue_number: int) -> None:
+        """Reset the issue-watcher idle clock (e.g. after a user reply)."""
+        try:
+            now = asyncio.get_running_loop().time()
+        except RuntimeError:
+            return
+        self._watcher_activity[issue_number] = now
 
     # ------------------------------------------------------------------
     # 1. Assign issue to GitHub Copilot Coding Agent
@@ -342,8 +351,9 @@ class CodingAgentAdapter:
                 issue_number,
                 comment.id,
             )
+            self.note_watcher_activity(issue_number)
             return CodingAgentEvent(
-                event_type=AgentEventType.COPILOT_QUESTION,  # re-use to signal conversation continues
+                event_type=AgentEventType.USER_REPLY,
                 job_id=job_id,
                 issue_number=issue_number,
                 comment_id=comment.id,
@@ -585,7 +595,8 @@ class CodingAgentAdapter:
         job_id:
             Pipeline job identifier for event correlation.
         timeout:
-            Maximum seconds to poll before giving up (default: 1 hour).
+            Idle timeout in seconds. The clock resets on every emitted
+            lifecycle event (start, question, PR). Default: 1 hour.
 
         Yields
         ------
@@ -593,87 +604,102 @@ class CodingAgentAdapter:
             One event per detected lifecycle change.
         """
         logger.info(
-            "Starting issue watcher for #%d (job_id=%s, timeout=%.0fs)",
+            "Starting issue watcher for #%d (job_id=%s, idle_timeout=%.0fs)",
             issue_number,
             job_id,
             timeout,
         )
         status = AgentStatus.ASSIGNED
         last_comment_id: Optional[int] = None
-        deadline = asyncio.get_event_loop().time() + timeout
+        loop = asyncio.get_running_loop()
+        last_activity = loop.time()
+        self._watcher_activity[issue_number] = last_activity
 
-        while asyncio.get_event_loop().time() < deadline:
-            try:
-                # --- Detect agent start ---
-                if status == AgentStatus.ASSIGNED:
-                    start_event = await self.detect_agent_start(
-                        issue_number, job_id, last_comment_id
-                    )
-                    if start_event:
-                        last_comment_id = start_event.comment_id
-                        status = AgentStatus.RUNNING
-                        yield start_event
-
-                # --- Detect questions ---
-                if status in (AgentStatus.RUNNING, AgentStatus.WAITING_REPLY):
-                    q_event = await self.detect_copilot_question(
-                        issue_number, job_id, last_comment_id
-                    )
-                    if q_event:
-                        last_comment_id = q_event.comment_id
-                        status = AgentStatus.WAITING_REPLY
-                        yield q_event
-
-                # --- Detect PR creation ---
-                if status == AgentStatus.RUNNING:
-                    pr_event = await self.detect_pull_request(issue_number, job_id)
-                    if pr_event:
-                        status = AgentStatus.PR_OPEN
-                        yield pr_event
-
-                # --- Detect completion ---
-                if status in (AgentStatus.RUNNING, AgentStatus.PR_OPEN):
-                    done_event = await self.detect_task_completion(issue_number, job_id)
-                    if done_event:
-                        status = AgentStatus.COMPLETED
-                        yield done_event
-                        return  # terminal — stop the watcher
-
-            except Exception as exc:  # pylint: disable=broad-except
-                logger.error(
-                    "Unexpected error in watch_issue for #%d: %s",
-                    issue_number,
-                    exc,
-                    exc_info=True,
+        try:
+            while True:
+                last_activity = max(
+                    last_activity, self._watcher_activity.get(issue_number, last_activity)
                 )
-                yield CodingAgentEvent(
-                    event_type=AgentEventType.ADAPTER_ERROR,
-                    job_id=job_id,
-                    issue_number=issue_number,
-                    agent_username=self._copilot_username,
-                    message=f"Watcher error on issue #{issue_number}: {exc}",
-                )
-                return  # stop on unexpected failure
+                if loop.time() - last_activity >= timeout:
+                    break
+                try:
+                    if status == AgentStatus.ASSIGNED:
+                        start_event = await self.detect_agent_start(
+                            issue_number, job_id, last_comment_id
+                        )
+                        if start_event:
+                            last_comment_id = start_event.comment_id
+                            status = AgentStatus.RUNNING
+                            last_activity = loop.time()
+                            self._watcher_activity[issue_number] = last_activity
+                            yield start_event
 
-            await asyncio.sleep(self._poll_interval)
+                    if status in (AgentStatus.RUNNING, AgentStatus.WAITING_REPLY):
+                        q_event = await self.detect_copilot_question(
+                            issue_number, job_id, last_comment_id
+                        )
+                        if q_event:
+                            last_comment_id = q_event.comment_id
+                            status = AgentStatus.WAITING_REPLY
+                            last_activity = loop.time()
+                            self._watcher_activity[issue_number] = last_activity
+                            yield q_event
 
-        # Timeout path
-        logger.warning(
-            "watch_issue timed out after %.0fs for issue #%d (job_id=%s)",
-            timeout,
-            issue_number,
-            job_id,
-        )
-        yield CodingAgentEvent(
-            event_type=AgentEventType.ADAPTER_ERROR,
-            job_id=job_id,
-            issue_number=issue_number,
-            agent_username=self._copilot_username,
-            message=(
-                f"Watcher timed out after {timeout:.0f}s monitoring issue #{issue_number}. "
-                "No completion signal was received."
-            ),
-        )
+                    if status in (AgentStatus.RUNNING, AgentStatus.WAITING_REPLY):
+                        pr_event = await self.detect_pull_request(issue_number, job_id)
+                        if pr_event:
+                            status = AgentStatus.PR_OPEN
+                            last_activity = loop.time()
+                            self._watcher_activity[issue_number] = last_activity
+                            yield pr_event
+
+                    if status in (
+                        AgentStatus.RUNNING,
+                        AgentStatus.PR_OPEN,
+                        AgentStatus.WAITING_REPLY,
+                    ):
+                        done_event = await self.detect_task_completion(issue_number, job_id)
+                        if done_event:
+                            status = AgentStatus.COMPLETED
+                            yield done_event
+                            return
+
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.error(
+                        "Unexpected error in watch_issue for #%d: %s",
+                        issue_number,
+                        exc,
+                        exc_info=True,
+                    )
+                    yield CodingAgentEvent(
+                        event_type=AgentEventType.ADAPTER_ERROR,
+                        job_id=job_id,
+                        issue_number=issue_number,
+                        agent_username=self._copilot_username,
+                        message=f"Watcher error on issue #{issue_number}: {exc}",
+                    )
+                    return
+
+                await asyncio.sleep(self._poll_interval)
+
+            logger.warning(
+                "watch_issue idle timeout after %.0fs for issue #%d (job_id=%s)",
+                timeout,
+                issue_number,
+                job_id,
+            )
+            yield CodingAgentEvent(
+                event_type=AgentEventType.ADAPTER_ERROR,
+                job_id=job_id,
+                issue_number=issue_number,
+                agent_username=self._copilot_username,
+                message=(
+                    f"No news from GitHub for {timeout:.0f}s while monitoring issue #{issue_number}. "
+                    "Check the issue manually — the webhook may be unreachable."
+                ),
+            )
+        finally:
+            self._watcher_activity.pop(issue_number, None)
 
     # ------------------------------------------------------------------
     # Webhook event parser — stateless, no I/O
@@ -796,13 +822,18 @@ class CodingAgentAdapter:
         issue_number: int,
         job_id: Optional[str],
     ) -> Optional[CodingAgentEvent]:
-        """Scan open PRs for one that references the tracked issue."""
+        """Scan open and closed PRs for one that references the tracked issue."""
         try:
             async for attempt in _make_retry_policy(self._max_retries, 1, 10):
                 with attempt:
                     prs_data: list = await self._client.get(  # type: ignore[assignment]
                         "/pulls",
-                        params={"state": "open", "per_page": 30},
+                        params={
+                            "state": "all",
+                            "sort": "updated",
+                            "direction": "desc",
+                            "per_page": 30,
+                        },
                     )
         except (GitHubClientError, RetryError) as exc:
             logger.warning("Could not list open PRs for issue #%d detection: %s", issue_number, exc)

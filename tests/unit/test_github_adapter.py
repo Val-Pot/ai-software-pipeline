@@ -222,6 +222,24 @@ def test_extract_refs_from_workflow_run_pull_requests():
     assert refs["pr_number"] == 9
 
 
+def test_extract_refs_from_workflow_run_includes_pr_url():
+    refs = extract_github_event_refs(
+        {
+            "workflow_run": {
+                "id": 55,
+                "pull_requests": [
+                    {
+                        "number": 9,
+                        "html_url": "https://github.com/o/r/pull/9",
+                    }
+                ],
+            }
+        }
+    )
+    assert refs["pr_number"] == 9
+    assert refs["pr_url"] == "https://github.com/o/r/pull/9"
+
+
 def test_extract_refs_ignores_active_job_sentinel():
     refs = extract_github_event_refs({"job_id": "active_job", "issue": {"number": 3}})
     assert "job_id" not in refs
@@ -257,13 +275,16 @@ def test_parse_event_workflow_run_includes_pr_number():
                 "id": 99,
                 "name": "CI",
                 "conclusion": "success",
-                "pull_requests": [{"number": 4}],
+                "pull_requests": [
+                    {"number": 4, "html_url": "https://github.com/o/r/pull/4"}
+                ],
             },
         },
     )
     assert event is not None
     assert event["event_type"] == "tests_passed"
     assert event["pr_number"] == 4
+    assert event["pr_url"] == "https://github.com/o/r/pull/4"
 
 
 def test_parse_event_ignores_pull_request_synchronize():

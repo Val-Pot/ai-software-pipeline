@@ -33,6 +33,9 @@ class AgentEventType(StrEnum):
     #: Copilot posted a clarifying question on the issue or PR.
     COPILOT_QUESTION = "copilot_question"
 
+    #: User reply posted back to the issue so Copilot can continue.
+    USER_REPLY = "user_reply"
+
     #: Copilot opened a Pull Request for the task.
     PR_CREATED = "pr_created"
 

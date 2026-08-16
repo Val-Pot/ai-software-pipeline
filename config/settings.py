@@ -62,7 +62,7 @@ class Settings(BaseSettings):
     #: Seconds between polling iterations when watching an issue.
     coding_agent_poll_interval: float = 10.0
 
-    #: Maximum seconds the issue watcher will run before giving up.
+    #: Idle seconds without a watcher event before giving up (clock resets on activity).
     coding_agent_watcher_timeout: float = 3600.0
 
     #: Maximum retry attempts for each GitHub API call in the coding agent.

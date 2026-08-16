@@ -53,6 +53,7 @@ class GitHubEventRefs(TypedDict, total=False):
     job_id: str
     issue_number: int
     pr_number: int
+    pr_url: str
 
 
 def _as_positive_int(value: Any) -> Optional[int]:
@@ -82,15 +83,20 @@ def extract_github_event_refs(payload: Dict[str, Any]) -> GitHubEventRefs:
 
     issue_number = _as_positive_int(issue.get("number"))
     pr_number = _as_positive_int(pr.get("number"))
+    pr_url = pr.get("html_url") if isinstance(pr.get("html_url"), str) else None
 
     # Comments on a PR use issue.number == PR number and set issue.pull_request.
     if pr_number is None and issue.get("pull_request") and issue_number is not None:
         pr_number = issue_number
 
+    pull_requests = run.get("pull_requests") or []
+    first_linked_pr = pull_requests[0] if pull_requests and isinstance(pull_requests[0], dict) else {}
     if pr_number is None:
-        pull_requests = run.get("pull_requests") or []
-        if pull_requests and isinstance(pull_requests[0], dict):
-            pr_number = _as_positive_int(pull_requests[0].get("number"))
+        pr_number = _as_positive_int(first_linked_pr.get("number"))
+    if not pr_url:
+        linked_url = first_linked_pr.get("html_url")
+        if isinstance(linked_url, str) and linked_url:
+            pr_url = linked_url
 
     bodies = [issue.get("body") or "", pr.get("body") or ""]
     for body in bodies:
@@ -107,6 +113,8 @@ def extract_github_event_refs(payload: Dict[str, Any]) -> GitHubEventRefs:
         refs["issue_number"] = issue_number
     if pr_number is not None:
         refs["pr_number"] = pr_number
+    if pr_url:
+        refs["pr_url"] = pr_url
     return refs
 
 

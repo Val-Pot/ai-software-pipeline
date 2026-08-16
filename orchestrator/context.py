@@ -36,6 +36,9 @@ class PipelineJob(BaseModel):
     retry_count: int = 0
     max_retries: int = 3
     processed_event_ids: Dict[str, str] = Field(default_factory=dict)  # event_id -> processed_at timestamp
+    #: CI webhook that arrived before WAIT_TESTS (``tests_passed`` / ``tests_failed``).
+    pending_ci_event: Optional[str] = None
+    pending_ci_failure_log: Optional[str] = None
 
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
