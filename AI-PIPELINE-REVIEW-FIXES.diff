@@ -1,0 +1,802 @@
+From: pipeline-review
+Date: Sun, 16 Aug 2026 13:00:00 +0300
+Subject: [PATCH] Review pass 3: close remaining pipeline holes
+
+UTF-8 without BOM. Unified diff vs origin/main.
+
+diff --git a/adapters/coding_agent/adapter.py b/adapters/coding_agent/adapter.py
+index fc76170..b42df63 100644
+--- a/adapters/coding_agent/adapter.py
++++ b/adapters/coding_agent/adapter.py
+@@ -12,13 +12,15 @@ from config.settings import Settings
+ from domain.models import EventType, PipelineEvent
+ 
+ _FIX_TRIGGER_TEXT = "@copilot Fix the failing tests"
++_MAX_FIX_LOG_CHARS = 12_000
+ 
+ _COMPLETION_RE = re.compile(
+     r"(task (is )?complete|ready for review|i('ve| have) completed)",
+     re.IGNORECASE,
+ )
+ _QUESTION_RE = re.compile(
+-    r"(\?|please (confirm|clarify|choose)|waiting for (your )?(reply|answer))",
++    r"(please (confirm|clarify|choose|reply)|waiting for (your )?(reply|answer)|"
++    r"could you|which (option|approach))",
+     re.IGNORECASE,
+ )
+ 
+@@ -40,7 +42,10 @@ class CodingAgentAdapter:
+         await self.github.issues.assign_copilot(issue_number)
+ 
+     async def trigger_fix_iteration(self, issue_number: int, error_log: str) -> None:
+-        body = f"{_FIX_TRIGGER_TEXT}\n\n```\n{error_log.strip()}\n```"
++        log = (error_log or "").strip()
++        if len(log) > _MAX_FIX_LOG_CHARS:
++            log = log[:_MAX_FIX_LOG_CHARS] + "\n...[truncated]"
++        body = f"{_FIX_TRIGGER_TEXT}\n\n```\n{log}\n```"
+         await self.github.comments.create_issue_comment(issue_number, body)
+ 
+     async def detect_task_completion(
+@@ -163,14 +168,13 @@ class CodingAgentAdapter:
+                     issue_number=issue_number,
+                     pr_number=pr_number,
+                 )
+-            elif conclusion in {"failure", "timed_out", "cancelled"}:
+-                logs = await self.github.actions.get_run_logs(run_id)
++            elif conclusion in {"failure", "timed_out"}:
+                 yield PipelineEvent(
+                     event_id=f"run-failure-{run_id}",
+                     type=EventType.TESTS_FAILED,
+                     issue_number=issue_number,
+                     pr_number=pr_number,
+-                    error_log=logs,
++                    error_log=run.get("html_url") or f"workflow run {run_id} failed",
+                 )
+ 
+     def _event_from_comment(
+@@ -227,7 +231,7 @@ class CodingAgentAdapter:
+             return None
+         if name == "issues" and payload.get("action") == "closed":
+             return PipelineEvent(
+-                event_id=self._stable_id("issue-closed", issue_number, payload.get("action")),
++                event_id=f"issue-closed-{issue_number}",
+                 type=EventType.ISSUE_CLOSED,
+                 issue_number=issue_number,
+             )
+@@ -239,20 +243,20 @@ class CodingAgentAdapter:
+         cid = comment.get("id") or self._stable_id(issue_number, body)
+         if self._looks_like_completion_text(body):
+             return PipelineEvent(
+-                event_id=f"wh-comment-complete-{cid}",
++                event_id=f"comment-complete-{cid}",
+                 type=EventType.AGENT_COMPLETED,
+                 issue_number=issue_number,
+                 body=body,
+             )
+         if self._looks_like_question(body):
+             return PipelineEvent(
+-                event_id=f"wh-comment-question-{cid}",
++                event_id=f"comment-question-{cid}",
+                 type=EventType.COPILOT_QUESTION,
+                 issue_number=issue_number,
+                 body=body,
+             )
+         return PipelineEvent(
+-            event_id=f"wh-comment-started-{cid}",
++            event_id=f"comment-started-{cid}",
+             type=EventType.AGENT_STARTED,
+             issue_number=issue_number,
+             body=body,
+@@ -273,7 +277,7 @@ class CodingAgentAdapter:
+             if pr.get("draft"):
+                 self._draft_seen.add(number)
+             return PipelineEvent(
+-                event_id=self._stable_id("pr", number, "opened"),
++                event_id=f"pr-opened-{number}",
+                 type=EventType.PR_OPENED,
+                 issue_number=issue_number,
+                 pr_number=number,
+@@ -284,7 +288,7 @@ class CodingAgentAdapter:
+             )
+         if action in {"ready_for_review", "review_requested"}:
+             return PipelineEvent(
+-                event_id=self._stable_id("pr", number, action),
++                event_id=f"agent-completed-{number}",
+                 type=EventType.AGENT_COMPLETED,
+                 issue_number=issue_number,
+                 pr_number=number,
+@@ -303,14 +307,14 @@ class CodingAgentAdapter:
+         issue_number = extract_issue_number(run.get("head_branch"))
+         if conclusion == "success":
+             return PipelineEvent(
+-                event_id=f"wh-run-success-{run_id}",
++                event_id=f"run-success-{run_id}",
+                 type=EventType.TESTS_PASSED,
+                 issue_number=issue_number,
+                 pr_number=pr_number,
+             )
+-        if conclusion in {"failure", "timed_out", "cancelled"}:
++        if conclusion in {"failure", "timed_out"}:
+             return PipelineEvent(
+-                event_id=f"wh-run-failure-{run_id}",
++                event_id=f"run-failure-{run_id}",
+                 type=EventType.TESTS_FAILED,
+                 issue_number=issue_number,
+                 pr_number=pr_number,
+diff --git a/adapters/coding_agent/issue_refs.py b/adapters/coding_agent/issue_refs.py
+index 6ae38c0..830722f 100644
+--- a/adapters/coding_agent/issue_refs.py
++++ b/adapters/coding_agent/issue_refs.py
+@@ -2,18 +2,20 @@ from __future__ import annotations
+ 
+ import re
+ 
+-_ISSUE_REF_RE = re.compile(
+-    r"(?:(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+)?#(\d+)",
++_CLOSES_RE = re.compile(
++    r"(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)",
+     re.IGNORECASE,
+ )
++_HASH_RE = re.compile(r"#(\d+)")
+ _BRANCH_ISSUE_RE = re.compile(r"issue[-/](\d+)", re.IGNORECASE)
+ 
+ 
+ def extract_issue_number(*texts: str | None) -> int | None:
+-    for text in texts:
+-        if not text:
+-            continue
+-        match = _ISSUE_REF_RE.search(text) or _BRANCH_ISSUE_RE.search(text)
+-        if match:
+-            return int(match.group(1))
++    for pattern in (_CLOSES_RE, _HASH_RE, _BRANCH_ISSUE_RE):
++        for text in texts:
++            if not text:
++                continue
++            match = pattern.search(text)
++            if match:
++                return int(match.group(1))
+     return None
+diff --git a/adapters/jobs/memory.py b/adapters/jobs/memory.py
+index 78a401c..86c420d 100644
+--- a/adapters/jobs/memory.py
++++ b/adapters/jobs/memory.py
+@@ -1,7 +1,7 @@
+ from __future__ import annotations
+ 
+ from domain.clock import utcnow
+-from domain.models import Job, JobState, PipelineEvent
++from domain.models import EventType, Job, JobState, PipelineEvent
+ 
+ 
+ class InMemoryJobRepository:
+@@ -29,17 +29,22 @@ class InMemoryJobRepository:
+         latest = max(matches, key=lambda item: item.updated_at)
+         return latest.model_copy(deep=True)
+ 
++    def _pick(self, matches: list[Job]) -> Job | None:
++        if not matches:
++            return None
++        live = [job for job in matches if job.state not in JobState.terminal()]
++        chosen = max(live or matches, key=lambda item: item.updated_at)
++        return chosen.model_copy(deep=True)
++
+     async def find_by_issue(self, issue_number: int) -> Job | None:
+-        for job in self._jobs.values():
+-            if job.issue_number == issue_number:
+-                return job.model_copy(deep=True)
+-        return None
++        return self._pick(
++            [job for job in self._jobs.values() if job.issue_number == issue_number]
++        )
+ 
+     async def find_by_pr(self, pr_number: int) -> Job | None:
+-        for job in self._jobs.values():
+-            if job.pr_number == pr_number:
+-                return job.model_copy(deep=True)
+-        return None
++        return self._pick(
++            [job for job in self._jobs.values() if job.pr_number == pr_number]
++        )
+ 
+     async def find_waiting_for_pr(self) -> Job | None:
+         matches = [
+@@ -60,6 +65,11 @@ class InMemoryJobRepository:
+             found = await self.find_by_pr(event.pr_number)
+             if found:
+                 return found
++        if event.issue_number is not None:
++            return None
++        if event.type == EventType.PR_OPENED:
++            return None
++        if event.pr_number is not None:
+             return await self.find_waiting_for_pr()
+         return None
+ 
+diff --git a/adapters/telegram/handlers.py b/adapters/telegram/handlers.py
+index 1c4f716..d8db818 100644
+--- a/adapters/telegram/handlers.py
++++ b/adapters/telegram/handlers.py
+@@ -32,6 +32,9 @@ class TelegramHandlers:
+         return job.id
+ 
+     async def on_start(self, message: Message) -> None:
++        if not _authorized(message.from_user.id if message.from_user else None, self.settings):
++            await message.answer("Нет доступа.")
++            return
+         await message.answer(
+             "AI Software Pipeline\n\n"
+             "/new <задача> — создать Issue и назначить Copilot\n"
+@@ -79,6 +82,9 @@ class TelegramHandlers:
+             await message.answer(str(exc))
+ 
+     async def on_status(self, message: Message) -> None:
++        if not _authorized(message.from_user.id if message.from_user else None, self.settings):
++            await message.answer("Нет доступа.")
++            return
+         job = await self.jobs.find_by_chat(message.chat.id)
+         if job is None:
+             await message.answer("Нет задач.")
+@@ -102,6 +108,14 @@ class TelegramHandlers:
+         job_id = parts[2] if len(parts) >= 3 else ""
+         if not job_id and callback.message:
+             job_id = await self._job_id_for_chat(callback.message.chat.id)
++        job = await self.jobs.get(job_id) if job_id else None
++        chat_id = callback.message.chat.id if callback.message else None
++        if job is None or (chat_id is not None and job.chat_id != chat_id):
++            await callback.answer("Нет доступа.", show_alert=True)
++            return
++        if job.user_id and user_id is not None and job.user_id != user_id:
++            await callback.answer("Нет доступа.", show_alert=True)
++            return
+         try:
+             await self.orchestrator.confirm_merge(job_id, confirmed)
+         except UserFacingError as exc:
+diff --git a/domain/models.py b/domain/models.py
+index 353747c..e51e46d 100644
+--- a/domain/models.py
++++ b/domain/models.py
+@@ -65,6 +65,7 @@ class Job(BaseModel):
+     agent_started_notified: bool = False
+     agent_completed_notified: bool = False
+     pipeline_check_posted: bool = False
++    issue_closed_notified: bool = False
+     state_before_merge: JobState | None = None
+ 
+ 
+diff --git a/orchestrator/pipeline_runner.py b/orchestrator/pipeline_runner.py
+index 76ddf17..1231418 100644
+--- a/orchestrator/pipeline_runner.py
++++ b/orchestrator/pipeline_runner.py
+@@ -30,10 +30,20 @@ class PipelineRunner:
+         self._watch_tasks: dict[str, asyncio.Task] = {}
+         self._watchdog_tasks: dict[str, asyncio.Task] = {}
+         self._stale_notified: set[str] = set()
++        self._watch_error_notified: set[str] = set()
+ 
+     async def start_job(
+         self, *, chat_id: int, user_id: int, title: str, body: str
+     ) -> Job:
++        previous = await self.jobs.find_by_chat(chat_id)
++        if previous is not None and previous.state not in JobState.terminal():
++            previous.state = JobState.FAILED
++            await self.jobs.save(previous)
++            self._stop_job_watchers(previous.id)
++            await self.notifier.send_text(
++                chat_id,
++                "Предыдущая задача остановлена: запущена новая.",
++            )
+         job = Job(
+             chat_id=chat_id,
+             user_id=user_id,
+@@ -55,29 +65,31 @@ class PipelineRunner:
+         return body.rstrip() + extra
+ 
+     async def trigger_coding_agent(self, job: Job) -> None:
+-        issue = await self.github.create_issue(job.title, job.body)
+-        job.issue_number = issue["number"]
+-        job.issue_url = issue.get("html_url") or ""
+-        await self.jobs.save(job)
++        created_now = False
++        if not job.issue_number:
++            issue = await self.github.create_issue(job.title, job.body)
++            job.issue_number = issue["number"]
++            job.issue_url = issue.get("html_url") or ""
++            await self.jobs.save(job)
++            created_now = True
+         await self.coding_agent.trigger(job.issue_number)
+-        await self.notifier.send_text(
+-            job.chat_id,
+-            f"Задача принята. Issue: {job.issue_url}\n"
+-            "Coding agent назначен и начал работу.",
+-        )
++        if created_now:
++            await self.notifier.send_text(
++                job.chat_id,
++                f"Задача принята. Issue: {job.issue_url}\n"
++                "Coding agent назначен и начал работу.",
++            )
+ 
+     async def _process_state(self, job: Job) -> None:
+         if job.state == JobState.TASK_ACCEPTED:
+             try:
+                 await self.trigger_coding_agent(job)
+             except AssignmentError as exc:
+-                job.state = JobState.ADAPTER_ERROR
+-                await self.jobs.save(job)
++                await self._enter_terminal(job, JobState.ADAPTER_ERROR)
+                 await self.notifier.send_text(job.chat_id, str(exc))
+                 return
+             except Exception as exc:
+-                job.state = JobState.ADAPTER_ERROR
+-                await self.jobs.save(job)
++                await self._enter_terminal(job, JobState.ADAPTER_ERROR)
+                 await self.notifier.send_text(
+                     job.chat_id, f"Не удалось запустить задачу: {exc}"
+                 )
+@@ -91,7 +103,10 @@ class PipelineRunner:
+                 return
+             job.pipeline_check_posted = True
+             await self.jobs.save(job)
+-            await self.github.run_ai_review(job.pr_number)
++            try:
++                await self.github.run_ai_review(job.pr_number)
++            except Exception as exc:
++                logger.warning("pipeline check comment failed: %s", exc)
+             await self.notifier.send_text(
+                 job.chat_id,
+                 "CI прошёл.\n"
+@@ -115,23 +130,39 @@ class PipelineRunner:
+                 name=f"stale-watchdog-{job.id}",
+             )
+ 
++    def _stop_job_watchers(self, job_id: str) -> None:
++        for bucket in (self._watch_tasks, self._watchdog_tasks):
++            task = bucket.pop(job_id, None)
++            if task is not None and not task.done():
++                task.cancel()
++
++    async def _enter_terminal(self, job: Job, state: JobState) -> None:
++        job.state = state
++        await self.jobs.save(job)
++        self._stop_job_watchers(job.id)
++
+     async def _run_watch_issue(self, job: Job) -> None:
+         if not job.issue_number:
+             return
+-        try:
+-            async for event in self.coding_agent.watch_issue(job.issue_number):
+-                fresh = await self.jobs.get(job.id)
+-                if fresh is None or fresh.state in JobState.terminal():
+-                    return
+-                await self.process_event(event)
+-        except asyncio.CancelledError:
+-            raise
+-        except Exception as exc:
+-            await self.notifier.send_text(
+-                job.chat_id,
+-                f"Ошибка резервного опроса GitHub: {exc}\n"
+-                f"Проверьте issue вручную: {job.issue_url}",
+-            )
++        while True:
++            try:
++                async for event in self.coding_agent.watch_issue(job.issue_number):
++                    fresh = await self.jobs.get(job.id)
++                    if fresh is None or fresh.state in JobState.terminal():
++                        return
++                    await self.process_event(event)
++                return
++            except asyncio.CancelledError:
++                raise
++            except Exception as exc:
++                if job.id not in self._watch_error_notified:
++                    await self.notifier.send_text(
++                        job.chat_id,
++                        f"Ошибка резервного опроса GitHub: {exc}\n"
++                        f"Проверьте issue вручную: {job.issue_url}",
++                    )
++                    self._watch_error_notified.add(job.id)
++                await asyncio.sleep(self.settings.coding_agent_poll_interval_sec)
+ 
+     async def _run_stale_watchdog(self, job: Job) -> None:
+         timeout = self.settings.coding_agent_stale_timeout_sec
+@@ -160,13 +191,22 @@ class PipelineRunner:
+         if job is None:
+             logger.info("No job for event %s", event.event_id)
+             return
++        if job.state in JobState.terminal():
++            self.processed_event_ids.add(event.event_id)
++            return
+         self.processed_event_ids.add(event.event_id)
++        if len(self.processed_event_ids) > 10_000:
++            self.processed_event_ids.clear()
++            self.processed_event_ids.add(event.event_id)
+         job.last_event_at = utcnow()
+         self._stale_notified.discard(job.id)
++        self._watch_error_notified.discard(job.id)
+         await self.jobs.save(job)
+ 
+         if event.type == EventType.AGENT_STARTED:
++            job.awaiting_user_reply = False
+             if job.agent_started_notified:
++                await self.jobs.save(job)
+                 return
+             job.agent_started_notified = True
+             await self.jobs.save(job)
+@@ -246,10 +286,16 @@ class PipelineRunner:
+         if event.type == EventType.TESTS_FAILED:
+             if job.state in JobState.terminal():
+                 return
++            job.awaiting_user_reply = False
++            await self.jobs.save(job)
+             await self._handle_test_failure(job, event.error_log or event.body)
+             return
+ 
+         if event.type == EventType.ISSUE_CLOSED and job.state not in JobState.terminal():
++            if job.issue_closed_notified:
++                return
++            job.issue_closed_notified = True
++            await self.jobs.save(job)
+             await self.notifier.send_text(
+                 job.chat_id,
+                 f"Issue закрыт.\n{job.issue_url}",
+@@ -259,7 +305,15 @@ class PipelineRunner:
+         # BUG-002 + BUG-003: единственный путь — подтверждённая команда @copilot
+         if not job.issue_number:
+             return
+-        await self.coding_agent.trigger_fix_iteration(job.issue_number, error_log)
++        try:
++            await self.coding_agent.trigger_fix_iteration(job.issue_number, error_log)
++        except Exception as exc:
++            await self.notifier.send_text(
++                job.chat_id,
++                f"Не удалось отправить @copilot Fix the failing tests: {exc}\n"
++                f"{job.issue_url}",
++            )
++            return
+         job.state = JobState.CODING_AGENT_RUNNING
+         await self.jobs.save(job)
+         await self.notifier.send_text(
+@@ -268,6 +322,11 @@ class PipelineRunner:
+             f"{job.issue_url}",
+         )
+ 
++    async def _mark_observed_merged(self, job: Job) -> None:
++        if job.state in JobState.terminal():
++            return
++        await self._enter_terminal(job, JobState.DONE)
++
+     async def recover_active_jobs(self) -> None:
+         for job in await self.jobs.list_non_terminal():
+             if job.state == JobState.TASK_ACCEPTED:
+@@ -275,13 +334,14 @@ class PipelineRunner:
+             if job.state in (
+                 JobState.CODING_AGENT_RUNNING,
+                 JobState.WAIT_TESTS,
++                JobState.TEST_PASSED,
+                 JobState.MERGE_CONFIRMATION_PENDING,
+             ):
+                 self._ensure_watchers(job)
+ 
+     def cancel_watchers(self) -> None:
+-        for task in list(self._watch_tasks.values()) + list(self._watchdog_tasks.values()):
+-            task.cancel()
++        for job_id in list(self._watch_tasks) + list(self._watchdog_tasks):
++            self._stop_job_watchers(job_id)
+ 
+     def _bound_pr(self, job: Job | None) -> Job:
+         if job is None:
+@@ -300,6 +360,7 @@ class PipelineRunner:
+             return
+         pr = await self.github.get_pull_request(job.pr_number)
+         if pr.merged:
++            await self._mark_observed_merged(job)
+             await self.notifier.send_text(job.chat_id, "Pull Request уже объединён.")
+             return
+         if pr.state == "closed":
+@@ -354,6 +415,7 @@ class PipelineRunner:
+             return
+         decision = await self._evaluate_merge(job)
+         if decision.already_merged:
++            await self._mark_observed_merged(job)
+             await self.notifier.send_text(
+                 job.chat_id, f"PR #{job.pr_number} уже объединён."
+             )
+@@ -377,6 +439,12 @@ class PipelineRunner:
+         job = await self.jobs.get(job_id)
+         if job is None:
+             raise UserFacingError("Задача не найдена.")
++        if confirmed and job.state != JobState.MERGE_CONFIRMATION_PENDING:
++            await self.notifier.send_text(
++                job.chat_id,
++                "Сначала отправьте /merge и подтвердите кнопкой.",
++            )
++            return
+         if not confirmed:
+             if job.state == JobState.MERGE_CONFIRMATION_PENDING:
+                 job.state = job.state_before_merge or (
+@@ -388,6 +456,7 @@ class PipelineRunner:
+             return
+         decision = await self._evaluate_merge(job)
+         if decision.already_merged:
++            await self._mark_observed_merged(job)
+             await self.notifier.send_text(
+                 job.chat_id, f"PR #{job.pr_number} уже объединён."
+             )
+@@ -406,8 +475,7 @@ class PipelineRunner:
+                 f"Причина: {exc.reason}",
+             )
+             return
+-        job.state = JobState.DONE
+-        await self.jobs.save(job)
++        await self._enter_terminal(job, JobState.DONE)
+         await self.notifier.send_text(
+             job.chat_id,
+             f"PR #{job.pr_number} успешно объединён.\n\n"
+diff --git a/tests/conftest.py b/tests/conftest.py
+index ee80296..8924671 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -58,9 +58,18 @@ class FakeGitHub:
+         self.store = store
+         self.actions = self
+         self.review_comments: list[str] = []
++        self.created_issues: list[dict] = []
+ 
+     async def create_issue(self, title: str, body: str) -> dict:
+-        return {"number": 1, "html_url": "https://github.com/acme/repo/issues/1"}
++        number = len(self.created_issues) + 1
++        issue = {
++            "number": number,
++            "html_url": f"https://github.com/acme/repo/issues/{number}",
++            "title": title,
++            "body": body,
++        }
++        self.created_issues.append(issue)
++        return issue
+ 
+     async def get_pull_request(self, pull_request_number: int) -> GitHubPullRequest:
+         return self.store.prs[pull_request_number]
+diff --git a/tests/test_event_binding.py b/tests/test_event_binding.py
+index 6e8d471..f053d30 100644
+--- a/tests/test_event_binding.py
++++ b/tests/test_event_binding.py
+@@ -69,7 +69,7 @@ async def test_unknown_event_is_not_consumed(harness):
+     assert "orphan" not in runner.processed_event_ids
+ 
+ 
+-async def test_pr_without_issue_binds_lone_running_job(harness):
++async def test_pr_without_issue_does_not_bind_lone_running_job(harness):
+     jobs, runner = harness["jobs"], harness["runner"]
+     job = await seed_job(jobs, state=JobState.CODING_AGENT_RUNNING, pr_number=None)
+     await runner.process_event(
+@@ -81,8 +81,8 @@ async def test_pr_without_issue_binds_lone_running_job(harness):
+         )
+     )
+     fresh = await jobs.get(job.id)
+-    assert fresh.pr_number == 12
+-    assert fresh.state == JobState.WAIT_TESTS
++    assert fresh.pr_number is None
++    assert fresh.state == JobState.CODING_AGENT_RUNNING
+ 
+ 
+ async def test_recover_does_not_repost_pipeline_check(harness):
+diff --git a/tests/test_pr_review_control.py b/tests/test_pr_review_control.py
+index bdd9737..d570b3d 100644
+--- a/tests/test_pr_review_control.py
++++ b/tests/test_pr_review_control.py
+@@ -125,10 +125,9 @@ async def test_pr007_already_merged_is_idempotent(harness):
+     store.prs[12] = open_pr(merged=True, state="closed")
+ 
+     await runner.request_merge(job.id)
+-    await runner.confirm_merge(job.id, True)
+ 
+     assert store.merge_calls == []
+-    assert all("уже объединён" in text for _, text in harness["notifier"].texts)
++    assert any("уже объединён" in text for _, text in harness["notifier"].texts)
+ 
+ 
+ async def test_pr008_no_pr_no_github_mutation(harness):
+diff --git a/tests/test_remaining_holes.py b/tests/test_remaining_holes.py
+new file mode 100644
+index 0000000..16080a6
+--- /dev/null
++++ b/tests/test_remaining_holes.py
+@@ -0,0 +1,185 @@
++from __future__ import annotations
++
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++from adapters.coding_agent.adapter import CodingAgentAdapter, _FIX_TRIGGER_TEXT
++from config.settings import Settings
++from domain.models import EventType, JobState, PipelineEvent
++from tests.conftest import open_pr, seed_job
++from webhooks.router import build_webhook_router, verify_signature
++
++
++async def test_recover_reuses_existing_issue(harness):
++    jobs, runner, github = harness["jobs"], harness["runner"], harness["github"]
++    await seed_job(
++        jobs,
++        state=JobState.TASK_ACCEPTED,
++        issue_number=3,
++        issue_url="https://github.com/acme/repo/issues/3",
++        pr_number=None,
++    )
++    await runner.recover_active_jobs()
++    assert github.created_issues == []
++    assert harness["coding_agent"].trigger_calls == [3]
++
++
++async def test_new_job_stops_previous(harness):
++    jobs, runner = harness["jobs"], harness["runner"]
++    old = await seed_job(jobs, state=JobState.CODING_AGENT_RUNNING, pr_number=None)
++    await runner.start_job(chat_id=100, user_id=7, title="next", body="next task")
++    fresh = await jobs.get(old.id)
++    assert fresh.state == JobState.FAILED
++    assert any("остановлена" in text for _, text in harness["notifier"].texts)
++
++
++async def test_confirm_merge_requires_pending(harness):
++    jobs, store, runner = harness["jobs"], harness["store"], harness["runner"]
++    job = await seed_job(jobs, state=JobState.WAIT_TESTS)
++    store.prs[12] = open_pr()
++    store.runs["copilot/fix-12"] = [
++        {"id": 1, "status": "completed", "conclusion": "success"}
++    ]
++    await runner.confirm_merge(job.id, True)
++    assert store.merge_calls == []
++    assert any("/merge" in text for _, text in harness["notifier"].texts)
++
++
++async def test_webhook_and_poll_share_event_ids():
++    adapter = CodingAgentAdapter(github=None, settings=Settings())
++    poll = adapter._event_from_comment(
++        3,
++        {
++            "id": 99,
++            "body": "Working on it",
++            "user": {"login": "copilot-swe-agent[bot]"},
++        },
++    )
++    hook = adapter.parse_webhook_event(
++        "issue_comment",
++        {
++            "action": "created",
++            "issue": {"number": 3},
++            "comment": {
++                "id": 99,
++                "body": "Working on it",
++                "user": {"login": "copilot-swe-agent[bot]"},
++            },
++        },
++    )
++    assert poll is not None and hook is not None
++    assert poll.event_id == hook.event_id == "comment-started-99"
++
++
++async def test_cancelled_run_does_not_trigger_fix():
++    adapter = CodingAgentAdapter(github=None, settings=Settings())
++    event = adapter.parse_webhook_event(
++        "workflow_run",
++        {
++            "workflow_run": {
++                "id": 5,
++                "status": "completed",
++                "conclusion": "cancelled",
++                "head_branch": "copilot/issue-3",
++                "pull_requests": [{"number": 12}],
++            }
++        },
++    )
++    assert event is None
++
++
++async def test_bare_question_mark_is_not_copilot_question():
++    adapter = CodingAgentAdapter(github=None, settings=Settings())
++    event = adapter._event_from_comment(
++        3,
++        {
++            "id": 1,
++            "body": "Pushed a commit. Next step?",
++            "user": {"login": "copilot-swe-agent[bot]"},
++        },
++    )
++    assert event is not None
++    assert event.type == EventType.AGENT_STARTED
++
++
++async def test_terminal_job_ignores_events(harness):
++    jobs, runner, notifier = harness["jobs"], harness["runner"], harness["notifier"]
++    await seed_job(jobs, state=JobState.DONE)
++    before = len(notifier.texts)
++    await runner.process_event(
++        PipelineEvent(
++            event_id="late",
++            type=EventType.AGENT_STARTED,
++            issue_number=3,
++        )
++    )
++    assert len(notifier.texts) == before
++
++
++async def test_fix_log_is_truncated(harness):
++    agent = harness["coding_agent"]
++    from adapters.coding_agent.adapter import CodingAgentAdapter
++
++    class _Comments:
++        def __init__(self):
++            self.bodies = []
++
++        async def create_issue_comment(self, issue_number, body):
++            self.bodies.append(body)
++
++    class _Github:
++        comments = _Comments()
++
++    real = CodingAgentAdapter(_Github(), Settings())
++    await real.trigger_fix_iteration(3, "E" * 20_000)
++    posted = real.github.comments.bodies[0]
++    assert posted.startswith(_FIX_TRIGGER_TEXT)
++    assert "...[truncated]" in posted
++    assert len(posted) < 20_000
++
++
++def test_webhook_rejects_missing_secret():
++    class _Settings:
++        github_webhook_secret = ""
++
++    class _Container:
++        settings = _Settings()
++        coding_agent = None
++        runner = None
++
++    app = FastAPI()
++    app.include_router(build_webhook_router(_Container()))
++    response = TestClient(app).post("/webhooks/github", json={"action": "ping"})
++    assert response.status_code == 503
++
++
++def test_signature_still_checks_when_secret_set():
++    body = b'{"ok":true}'
++    assert verify_signature("s3cret", body, "sha256=nope") is False
++
++
++async def test_observed_merge_marks_job_done(harness):
++    jobs, store, runner = harness["jobs"], harness["store"], harness["runner"]
++    job = await seed_job(jobs, state=JobState.WAIT_TESTS)
++    store.prs[12] = open_pr(merged=True, state="closed")
++    await runner.request_merge(job.id)
++    fresh = await jobs.get(job.id)
++    assert fresh.state == JobState.DONE
++    assert store.merge_calls == []
++
++
++async def test_recover_watches_test_passed(harness):
++    jobs, runner = harness["jobs"], harness["runner"]
++    job = await seed_job(jobs, state=JobState.TEST_PASSED)
++    await runner.recover_active_jobs()
++    assert job.id in runner._watch_tasks
++
++
++async def test_issue_closed_ids_match():
++    adapter = CodingAgentAdapter(github=None, settings=Settings())
++    hook = adapter.parse_webhook_event(
++        "issues",
++        {"action": "closed", "issue": {"number": 3}},
++    )
++    assert hook is not None
++    assert hook.event_id == "issue-closed-3"
+diff --git a/webhooks/router.py b/webhooks/router.py
+index e81a083..7f0e047 100644
+--- a/webhooks/router.py
++++ b/webhooks/router.py
+@@ -30,6 +30,8 @@ def build_webhook_router(container) -> APIRouter:
+     ):
+         body = await request.body()
+         settings = container.settings
++        if not (settings.github_webhook_secret or "").strip():
++            raise HTTPException(status_code=503, detail="webhook secret is not configured")
+         if not verify_signature(settings.github_webhook_secret, body, x_hub_signature_256):
+             raise HTTPException(status_code=401, detail="invalid signature")
+         try:

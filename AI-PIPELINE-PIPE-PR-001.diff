@@ -1,0 +1,492 @@
+From: pipeline-review
+Date: Sun, 16 Aug 2026 15:44:00 +0300
+Subject: [PATCH] PIPE-PR-001 review control: close remaining TZ holes
+
+UTF-8 without BOM. Unified diff vs origin/main parent commit set.
+
+diff --git a/README.md b/README.md
+index 8a83949..63deaf0 100644
+--- a/README.md
++++ b/README.md
+@@ -3,9 +3,17 @@
+ Telegram control channel for GitHub Copilot coding agent.
+ 
+ ```
+-/new → Issue → Copilot → PR → Telegram (ссылка)
+-     → /diff → PR-N.diff → внешнее ревью → при необходимости Copilot fixes
+-     → /diff → /merge → confirmation → GitHub merge → задача завершена
++/new
++  → GitHub Issue
++  → Copilot
++  → PR
++  → Telegram: PR создан
++  → /diff → PR-N.diff → внешнее ревью
++  → при необходимости Copilot fixes → новый commit
++  → /diff → повторное ревью
++  → /merge → подтверждение
++  → GitHub merge
++  → Telegram: задача завершена
+ ```
+ 
+ AI-review в MVP нет: комментарий «Pipeline check: CI passed, no automated review configured.»
+@@ -62,8 +70,8 @@ python -m app.main
+ | Command | Effect |
+ | --- | --- |
+ | `/new <text>` | Create issue, assign Copilot |
+-| `/diff` | Live unified diff of the current job PR |
+-| `/merge` | Status + Merge/Cancel buttons |
++| `/diff` | Live unified diff of the current job PR as `PR-{n}.diff` |
++| `/merge` | Status + Merge/Cancel for the current job PR only (`/merge 123` is ignored) |
+ | `/status` | Current job state |
+ 
+ ## Tests
+@@ -72,7 +80,7 @@ python -m app.main
+ pytest
+ ```
+ 
+-Covers BUG-001…009, PR-001…PR-013, and process-restart persistence (`TEST-015+`).
++Covers BUG-001…009 and PIPE-PR-001 (`TEST-015+`, PR-001…PR-024).
+ 
+ ## Layout
+ 
+diff --git a/docs/Acceptance_Test_Program.md b/docs/Acceptance_Test_Program.md
+index ac3a24f..5e5677d 100644
+--- a/docs/Acceptance_Test_Program.md
++++ b/docs/Acceptance_Test_Program.md
+@@ -48,8 +48,19 @@ Bot text does not claim an AI review that was not performed.
+ | PR-008 | No PR → clear text, no GitHub mutation |
+ | PR-009 | Telegram `send_document` error → PR/job unchanged |
+ | PR-010 | GitHub merge error → job not `DONE` |
+-| PR-011 | Confirm after HEAD moved → no merge, must `/merge` again |
+-| PR-012 | Process restart reloads jobs from `JOBS_STORE_PATH` and notifies the operator |
+-| PR-013 | Merge callback without job_id still answers Telegram (button does not hang) |
+-
+-Automated coverage: `tests/test_pr_review_control.py`, `tests/test_bug_regressions.py`, `tests/test_review_followup.py`.
++| PR-011 | Closed unmerged PR → `/diff` refused, no file |
++| PR-012 | Empty diff → text only, no empty file |
++| PR-013 | Oversized diff → not truncated, GitHub link kept |
++| PR-014 | GitHub down on `/diff` → user-facing error, no hang |
++| PR-015 | Copilot waiting for a reply → `/merge` refused |
++| PR-016 | Closed unmerged PR → `/merge` refused |
++| PR-017 | CI PASS on `/merge`, FAILURE on confirm → no merge |
++| PR-018 | `/merge` after `DONE` → “уже объединён”, no second merge |
++| PR-019 | GitHub down on merge check → user-facing error |
++| PR-020 | `/merge 123` uses the current job, not PR 123 |
++| PR-021 | Empty allowlist → `/diff` and `/merge` denied |
++| PR-022 | Confirm after HEAD moved → no merge, must `/merge` again |
++| PR-023 | Process restart reloads jobs and notifies the operator |
++| PR-024 | Merge callback without job_id still answers Telegram |
++
++Automated coverage: `tests/test_pr_review_control.py`, `tests/test_bug_regressions.py`, `tests/test_review_followup.py`, `tests/test_hygiene.py`.
+diff --git a/docs/Architecture_Description.md b/docs/Architecture_Description.md
+index 4f1f5ab..5673ae1 100644
+--- a/docs/Architecture_Description.md
++++ b/docs/Architecture_Description.md
+@@ -46,6 +46,15 @@ One login: `copilot-swe-agent[bot]`. The older assumption of a separate `github-
+ 
+ Single parse path: `webhooks/router.py` → `coding_agent.parse_webhook_event` → `process_event`. Dead `handle_*` helpers are not present.
+ 
++## Review / merge control (PIPE-PR-001)
++
++Telegram is a thin control channel, not a GitHub client.
++
++- `/diff` → Orchestrator.`request_diff` → GitHubPort.`get_pull_request_diff` (live unified diff) → NotifierPort.`send_document` (`PR-{n}.diff`)
++- `/merge` → Orchestrator.`request_merge` (status + buttons) → `confirm_merge` → GitHubPort.`merge_pull_request`
++- Job FSM is the only process model (`MERGE_CONFIRMATION_PENDING` is a job state, not a Telegram FSM)
++- `/merge 123` is not implemented; only the PR bound to the current job is used
++
+ ## Review comment
+ 
+ MVP does not run an LLM review. After CI pass the bot posts:
+diff --git a/docs/Detailed_Technical_Specification.md b/docs/Detailed_Technical_Specification.md
+index 55303ac..fdd2761 100644
+--- a/docs/Detailed_Technical_Specification.md
++++ b/docs/Detailed_Technical_Specification.md
+@@ -47,22 +47,23 @@ Primary signal: non-empty `requested_reviewers`, or the PR left draft after we a
+ 
+ ### FR-6 `/diff`
+ 
+-`/diff` returns the current unified diff of the job's PR as a Telegram document `PR-{n}.diff`.
++`/diff` returns the current unified diff of the job's PR as a Telegram document `PR-{n}.diff` with caption `PR #{n} — актуальный diff для ревью`. Extra arguments (`/diff 123`) are ignored; only the current job PR is used.
+ 
+ | Condition | Message |
+ | --- | --- |
+ | no PR | Для текущей задачи Pull Request ещё не создан. |
+ | PR closed | Pull Request закрыт. Актуальный diff недоступен. |
+ | PR merged | Pull Request уже объединён. |
+-| GitHub error | Не удалось получить diff Pull Request. |
++| GitHub error | Не удалось получить diff Pull Request. Попробуйте повторить команду позже. |
+ | empty diff | В Pull Request нет изменений для передачи на ревью. |
+-| over Telegram limit | Diff сформирован, но его размер превышает лимит Telegram. |
++| over Telegram limit | Diff сформирован, но его размер превышает лимит Telegram. + PR link |
++| Telegram send error | Не удалось отправить diff в Telegram. + PR link |
+ 
+-The diff is always fetched live (`Accept: application/vnd.github.diff`). No cache. A Telegram send failure does not change PR/job state.
++The diff is always fetched live (`Accept: application/vnd.github.diff`). No cache, no local agent diff, no PR body, no file list. A Telegram send failure does not change PR/job state. The earlier “PR created” notification is not replaced.
+ 
+ ### FR-7 `/merge`
+ 
+-`/merge` never merges immediately. It shows status and asks for confirmation.
++`/merge` never merges immediately. It shows status and asks for confirmation. `/merge 123` is out of scope and is ignored — only the current job PR can be merged.
+ 
+ ```
+ PR #{n}
+@@ -81,10 +82,21 @@ Checks run on `/merge` and again on confirm (TOCTOU):
+ - PR is open and not merged
+ - required GitHub Actions completed successfully
+ - Copilot is not waiting for a user reply
++- operator is on the Telegram allowlist
+ - GitHub allows merge (`mergeable` / `mergeable_state`)
+ - confirm merges the SHA frozen at `/merge`, not current HEAD; if the SHA changed, merge is denied and the operator must `/merge` again
+ 
+-Success moves the job to `DONE`. GitHub merge errors leave the job non-DONE.
++| Condition | Message |
++| --- | --- |
++| CI running | Merge пока невозможен: проверки CI ещё выполняются. |
++| CI failure | Merge невозможен: CI завершился с ошибкой. |
++| already merged | PR #{n} уже объединён. |
++| closed without merge | PR закрыт и не может быть объединён. |
++| Copilot waiting | Merge пока невозможен: Copilot ожидает ответа пользователя. |
++| HEAD moved | PR изменился с момента /merge. Повторите /merge. |
++| GitHub merge error | Не удалось выполнить merge PR #{n}. Причина: \<GitHub\> |
++
++Success: `PR #{n} успешно объединён.` + `Задача завершена.` + PR URL, job → `DONE`. GitHub merge errors leave the job non-DONE. Telegram never calls GitHub; merge goes Orchestrator → GitHubPort → GitHub Adapter → API.
+ 
+ ### FR-8 Authorization
+ 
+diff --git a/orchestrator/pipeline_runner.py b/orchestrator/pipeline_runner.py
+index 1da47ea..2533803 100644
+--- a/orchestrator/pipeline_runner.py
++++ b/orchestrator/pipeline_runner.py
+@@ -369,7 +369,15 @@ class PipelineRunner:
+             if job is not None:
+                 await self.notifier.send_text(job.chat_id, str(exc))
+             return
+-        pr = await self.github.get_pull_request(job.pr_number)
++        try:
++            pr = await self.github.get_pull_request(job.pr_number)
++        except Exception:
++            await self.notifier.send_text(
++                job.chat_id,
++                "Не удалось получить diff Pull Request.\n"
++                "Попробуйте повторить команду позже.",
++            )
++            return
+         if pr.merged:
+             await self._mark_observed_merged(job)
+             await self.notifier.send_text(job.chat_id, "Pull Request уже объединён.")
+@@ -398,7 +406,7 @@ class PipelineRunner:
+         if len(data) > self.settings.telegram_max_document_bytes:
+             await self.notifier.send_text(
+                 job.chat_id,
+-                "Diff сформирован, но его размер превышает лимит Telegram.\n"
++                "Diff сформирован, но его размер превышает лимит Telegram.\n\n"
+                 f"PR: {pr.html_url}",
+             )
+             return
+@@ -424,7 +432,15 @@ class PipelineRunner:
+             if job is not None:
+                 await self.notifier.send_text(job.chat_id, str(exc))
+             return
+-        decision = await self._evaluate_merge(job)
++        try:
++            decision = await self._evaluate_merge(job)
++        except Exception:
++            await self.notifier.send_text(
++                job.chat_id,
++                "Не удалось проверить состояние Pull Request.\n"
++                "Попробуйте повторить команду позже.",
++            )
++            return
+         if decision.already_merged:
+             await self._mark_observed_merged(job)
+             await self.notifier.send_text(
+@@ -461,7 +477,15 @@ class PipelineRunner:
+                 await self._revert_merge_pending(job)
+             await self.notifier.send_text(job.chat_id, "Merge отменён.")
+             return
+-        decision = await self._evaluate_merge(job)
++        try:
++            decision = await self._evaluate_merge(job)
++        except Exception:
++            await self.notifier.send_text(
++                job.chat_id,
++                "Не удалось проверить состояние Pull Request.\n"
++                "Попробуйте повторить команду позже.",
++            )
++            return
+         if decision.already_merged:
+             await self._mark_observed_merged(job)
+             await self.notifier.send_text(
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 8924671..eff4f2d 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -50,6 +50,7 @@ class FakePRStore:
+     merge_calls: list[dict] = field(default_factory=list)
+     diff_calls: list[int] = field(default_factory=list)
+     fail_diff = False
++    fail_get_pr = False
+     fail_merge: str | None = None
+ 
+ 
+@@ -72,6 +73,8 @@ class FakeGitHub:
+         return issue
+ 
+     async def get_pull_request(self, pull_request_number: int) -> GitHubPullRequest:
++        if self.store.fail_get_pr:
++            raise RuntimeError("github unavailable")
+         return self.store.prs[pull_request_number]
+ 
+     async def get_pull_request_diff(
+diff --git a/tests/test_hygiene.py b/tests/test_hygiene.py
+index caaac17..dcdd2ad 100644
+--- a/tests/test_hygiene.py
++++ b/tests/test_hygiene.py
+@@ -34,3 +34,13 @@ def test_no_live_github_copilot_bot_default():
+         if "github-copilot[bot]" in text and not allowed_context:
+             forbidden.append(str(path.relative_to(ROOT)))
+     assert forbidden == []
++
++
++def test_telegram_adapter_does_not_import_github():
++    telegram_root = ROOT / "adapters" / "telegram"
++    leaks = []
++    for path in telegram_root.rglob("*.py"):
++        text = path.read_text(encoding="utf-8")
++        if "adapters.github" in text or "from ports.github" in text:
++            leaks.append(str(path.relative_to(ROOT)))
++    assert leaks == []
+diff --git a/tests/test_pr_review_control.py b/tests/test_pr_review_control.py
+index 63240be..7784056 100644
+--- a/tests/test_pr_review_control.py
++++ b/tests/test_pr_review_control.py
+@@ -192,3 +192,147 @@ async def test_pr010_github_merge_failure_does_not_mark_done(harness):
+     assert fresh.state != JobState.DONE
+     assert any("Не удалось выполнить merge" in text for _, text in harness["notifier"].texts)
+     assert any("required status check" in text for _, text in harness["notifier"].texts)
++
++
++async def test_pr011_closed_pr_blocks_diff(harness):
++    jobs, store, runner, notifier = (
++        harness["jobs"],
++        harness["store"],
++        harness["runner"],
++        harness["notifier"],
++    )
++    job = await seed_job(jobs)
++    store.prs[12] = open_pr(merged=False, state="closed")
++    store.diffs[12] = "should-not-send\n"
++
++    await runner.request_diff(job.id)
++
++    assert store.diff_calls == []
++    assert store.merge_calls == []
++    assert notifier.documents == []
++    assert any("закрыт" in text and "недоступен" in text for _, text in notifier.texts)
++
++
++async def test_pr012_empty_diff_is_not_sent_as_file(harness):
++    jobs, store, runner, notifier = (
++        harness["jobs"],
++        harness["store"],
++        harness["runner"],
++        harness["notifier"],
++    )
++    job = await seed_job(jobs)
++    store.prs[12] = open_pr()
++    store.diffs[12] = "   \n"
++
++    await runner.request_diff(job.id)
++
++    assert store.diff_calls == [12]
++    assert notifier.documents == []
++    assert any("нет изменений" in text for _, text in notifier.texts)
++
++
++async def test_pr013_oversized_diff_is_not_truncated(harness, settings):
++    settings.telegram_max_document_bytes = 8
++    jobs, store, runner, notifier = (
++        harness["jobs"],
++        harness["store"],
++        harness["runner"],
++        harness["notifier"],
++    )
++    job = await seed_job(jobs)
++    store.prs[12] = open_pr()
++    store.diffs[12] = "diff --git a/x b/x\n+too-big\n"
++
++    await runner.request_diff(job.id)
++
++    assert notifier.documents == []
++    assert store.prs[12].merged is False
++    text = next(t for _, t in notifier.texts if "превышает лимит" in t)
++    assert "PR: https://github.com/acme/repo/pull/12" in text
++    assert "\n\nPR:" in text
++
++
++async def test_pr014_github_down_on_diff(harness):
++    jobs, store, runner, notifier = (
++        harness["jobs"],
++        harness["store"],
++        harness["runner"],
++        harness["notifier"],
++    )
++    job = await seed_job(jobs)
++    store.fail_get_pr = True
++
++    await runner.request_diff(job.id)
++
++    assert store.diff_calls == []
++    assert store.merge_calls == []
++    assert any("Не удалось получить diff" in text for _, text in notifier.texts)
++
++
++async def test_pr015_copilot_waiting_blocks_merge(harness):
++    jobs, store, runner = harness["jobs"], harness["store"], harness["runner"]
++    job = await seed_job(jobs, awaiting_user_reply=True)
++    store.prs[12] = open_pr()
++    store.runs["copilot/fix-12"] = [
++        {"id": 1, "status": "completed", "conclusion": "success"}
++    ]
++
++    await runner.request_merge(job.id)
++
++    assert store.merge_calls == []
++    assert any("ожидает ответа" in text for _, text in harness["notifier"].texts)
++
++
++async def test_pr016_closed_unmerged_pr_blocks_merge(harness):
++    jobs, store, runner = harness["jobs"], harness["store"], harness["runner"]
++    job = await seed_job(jobs)
++    store.prs[12] = open_pr(merged=False, state="closed")
++
++    await runner.request_merge(job.id)
++
++    assert store.merge_calls == []
++    assert any("закрыт и не может быть объединён" in text for _, text in harness["notifier"].texts)
++
++
++async def test_pr017_ci_flips_after_confirmation_screen(harness):
++    jobs, store, runner = harness["jobs"], harness["store"], harness["runner"]
++    job = await seed_job(jobs)
++    store.prs[12] = open_pr()
++    store.runs["copilot/fix-12"] = [
++        {"id": 1, "status": "completed", "conclusion": "success"}
++    ]
++
++    await runner.request_merge(job.id)
++    assert store.merge_calls == []
++
++    store.runs["copilot/fix-12"] = [
++        {"id": 2, "status": "completed", "conclusion": "failure"}
++    ]
++    await runner.confirm_merge(job.id, True)
++
++    assert store.merge_calls == []
++    fresh = await jobs.get(job.id)
++    assert fresh.state != JobState.DONE
++    assert any("CI завершился с ошибкой" in text for _, text in harness["notifier"].texts)
++
++
++async def test_pr018_second_merge_after_done_is_idempotent(harness):
++    jobs, store, runner = harness["jobs"], harness["store"], harness["runner"]
++    job = await seed_job(jobs, state=JobState.DONE)
++    store.prs[12] = open_pr(merged=True, state="closed")
++
++    await runner.request_merge(job.id)
++
++    assert store.merge_calls == []
++    assert any("уже объединён" in text for _, text in harness["notifier"].texts)
++
++
++async def test_pr019_github_down_on_merge_check(harness):
++    jobs, store, runner = harness["jobs"], harness["store"], harness["runner"]
++    job = await seed_job(jobs)
++    store.fail_get_pr = True
++
++    await runner.request_merge(job.id)
++
++    assert store.merge_calls == []
++    assert any("Не удалось проверить состояние" in text for _, text in harness["notifier"].texts)
+diff --git a/tests/test_review_followup.py b/tests/test_review_followup.py
+index b6f70b5..d2ff9c3 100644
+--- a/tests/test_review_followup.py
++++ b/tests/test_review_followup.py
+@@ -177,3 +177,76 @@ async def test_merge_callback_answers_when_job_id_lookup_fails():
+     assert callback.answers
+     assert callback.answers[0]["alert"] is True
+     assert "Нет активной задачи" in callback.answers[0]["text"]
++
++
++class _Message:
++    def __init__(self, text: str, *, user_id: int = 7, chat_id: int = 100) -> None:
++        self.text = text
++        self.chat = SimpleNamespace(id=chat_id)
++        self.from_user = SimpleNamespace(id=user_id)
++        self.reply_to_message = None
++        self.answers: list[str] = []
++
++    async def answer(self, text: str) -> None:
++        self.answers.append(text)
++
++
++async def test_merge_ignores_user_supplied_pr_number():
++    from adapters.jobs.memory import InMemoryJobRepository
++
++    jobs = InMemoryJobRepository()
++    job = await seed_job(jobs)
++    settings = Settings(telegram_allowed_user_ids="7")
++    calls: list[str] = []
++
++    class _Orch:
++        async def request_merge(self, job_id: str) -> None:
++            calls.append(job_id)
++
++    handlers = TelegramHandlers(_Orch(), jobs, settings)
++    await handlers.on_merge(_Message("/merge 123"))
++
++    assert calls == [job.id]
++
++
++async def test_diff_ignores_user_supplied_pr_number():
++    from adapters.jobs.memory import InMemoryJobRepository
++
++    jobs = InMemoryJobRepository()
++    job = await seed_job(jobs)
++    settings = Settings(telegram_allowed_user_ids="7")
++    calls: list[str] = []
++
++    class _Orch:
++        async def request_diff(self, job_id: str) -> None:
++            calls.append(job_id)
++
++    handlers = TelegramHandlers(_Orch(), jobs, settings)
++    await handlers.on_diff(_Message("/diff 99"))
++
++    assert calls == [job.id]
++
++
++async def test_diff_and_merge_fail_closed_without_allowlist():
++    from adapters.jobs.memory import InMemoryJobRepository
++
++    jobs = InMemoryJobRepository()
++    settings = Settings(telegram_allowed_user_ids="")
++    called = {"diff": 0, "merge": 0}
++
++    class _Orch:
++        async def request_diff(self, job_id: str) -> None:
++            called["diff"] += 1
++
++        async def request_merge(self, job_id: str) -> None:
++            called["merge"] += 1
++
++    handlers = TelegramHandlers(_Orch(), jobs, settings)
++    diff_msg = _Message("/diff")
++    merge_msg = _Message("/merge")
++    await handlers.on_diff(diff_msg)
++    await handlers.on_merge(merge_msg)
++
++    assert called == {"diff": 0, "merge": 0}
++    assert diff_msg.answers == ["Нет доступа."]
++    assert merge_msg.answers == ["Нет доступа."]

@@ -1,71 +1,30 @@
-# ==============================================================================
-# AI Software Pipeline — Docker Compose
-# Local development environment
-# ==============================================================================
-
 services:
-
-  # ── Main Application ────────────────────────────────────────────────────────
   pipeline:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: production
-    container_name: ai-pipeline-app
+    build: .
+    image: ai-software-pipeline:latest
     restart: unless-stopped
-
-    # Load all env vars from .env file (never committed to VCS)
+    ports:
+      - "${PORT:-8080}:8080"
     env_file:
       - .env
-
-    # Override env vars for containerised networking
     environment:
-      # Bind to all interfaces inside the container
       HOST: "0.0.0.0"
-      PORT: "8000"
-      # In local dev, long-polling is simpler than webhook
-      TELEGRAM_USE_WEBHOOK: "false"
-      # Python won't buffer stdout — required for live log streaming
-      PYTHONUNBUFFERED: "1"
-      PYTHONDONTWRITEBYTECODE: "1"
-
-    ports:
-      - "8000:8000"
-
+      PORT: "8080"
+      JOBS_STORE_PATH: /app/data/jobs.json
     volumes:
-      # Mount source code for hot-reload in development
-      # Remove this in production deployments
-      - .:/app:ro
-
+      - pipeline-data:/app/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=4)",
+        ]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 15s
+      start_period: 20s
 
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  # ── (Optional) Redis — reserved for future persistence layer ───────────────
-  # Uncomment to swap InMemoryPersistenceAdapter for a Redis-backed one.
-  #
-  # redis:
-  #   image: redis:7-alpine
-  #   container_name: ai-pipeline-redis
-  #   restart: unless-stopped
-  #   ports:
-  #     - "6379:6379"
-  #   volumes:
-  #     - redis_data:/data
-  #   healthcheck:
-  #     test: ["CMD", "redis-cli", "ping"]
-  #     interval: 10s
-  #     timeout: 3s
-  #     retries: 3
-
-# volumes:
-#   redis_data:
+volumes:
+  pipeline-data:

@@ -1,0 +1,629 @@
+From: pipeline-review
+Date: Sun, 16 Aug 2026 13:36:00 +0300
+Subject: [PATCH] Persist jobs across restart, pin merge SHA, fix merge callback
+
+UTF-8 without BOM. Unified diff vs origin/main.
+
+diff --git a/.env.example b/.env.example
+index 2dca070..b0ea05e 100644
+--- a/.env.example
++++ b/.env.example
+@@ -24,3 +24,6 @@ CODING_AGENT_POLL_TIMEOUT_SEC=21600
+ HOST=0.0.0.0
+ PORT=8080
+ LOG_LEVEL=INFO
++
++# Job store. Empty value = in-memory (lost on process restart).
++JOBS_STORE_PATH=data/jobs.json
+diff --git a/.gitignore b/.gitignore
+index a18a769..d31ed8d 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -14,3 +14,4 @@ htmlcov/
+ .vscode/
+ dist/
+ build/
++data/
+diff --git a/README.md b/README.md
+index d3ac7ce..8a83949 100644
+--- a/README.md
++++ b/README.md
+@@ -49,6 +49,7 @@ Fill `.env`:
+ | `GITHUB_OWNER` / `GITHUB_REPO` | Target repository |
+ | `GITHUB_WEBHOOK_SECRET` | Secret for `POST /webhooks/github` |
+ | `COPILOT_USERNAME` | `copilot-swe-agent[bot]` |
++| `JOBS_STORE_PATH` | JSON file for jobs + processed event IDs. Empty = in-memory only. |
+ 
+ Point a GitHub webhook at `https://<host>/webhooks/github` for `issues`, `issue_comment`, `pull_request`, `workflow_run`. Polling still works if the webhook is missing.
+ 
+@@ -71,12 +72,12 @@ python -m app.main
+ pytest
+ ```
+ 
+-Covers BUG-001…009 and PR-001…PR-010 (`TEST-015+`).
++Covers BUG-001…009, PR-001…PR-013, and process-restart persistence (`TEST-015+`).
+ 
+ ## Layout
+ 
+ ```
+-adapters/     GitHub, Telegram, coding agent, in-memory jobs
++adapters/     GitHub, Telegram, coding agent, file/in-memory jobs
+ orchestrator/ Job FSM, watchers, /diff, /merge
+ ports/        Protocols — Telegram does not import GitHub
+ webhooks/     Signature check → parse_webhook_event
+diff --git a/adapters/jobs/__init__.py b/adapters/jobs/__init__.py
+index 0394e37..48d1b41 100644
+--- a/adapters/jobs/__init__.py
++++ b/adapters/jobs/__init__.py
+@@ -1,3 +1,4 @@
++from adapters.jobs.file_store import FileJobRepository
+ from adapters.jobs.memory import InMemoryJobRepository
+ 
+-__all__ = ["InMemoryJobRepository"]
++__all__ = ["FileJobRepository", "InMemoryJobRepository"]
+diff --git a/adapters/jobs/file_store.py b/adapters/jobs/file_store.py
+new file mode 100644
+index 0000000..a33a17b
+--- /dev/null
++++ b/adapters/jobs/file_store.py
+@@ -0,0 +1,63 @@
++from __future__ import annotations
++
++import asyncio
++import json
++import logging
++from pathlib import Path
++
++from adapters.jobs.memory import InMemoryJobRepository
++from domain.models import Job
++
++logger = logging.getLogger(__name__)
++
++
++class FileJobRepository(InMemoryJobRepository):
++    """JobRepository that survives process restart via an atomic JSON file."""
++
++    def __init__(self, path: str | Path) -> None:
++        super().__init__()
++        self._path = Path(path)
++        self.processed_event_ids: set[str] = set()
++        self._lock = asyncio.Lock()
++        self._load()
++
++    def _load(self) -> None:
++        if not self._path.exists():
++            return
++        try:
++            payload = json.loads(self._path.read_text(encoding="utf-8"))
++        except (OSError, json.JSONDecodeError) as exc:
++            logger.warning("job store unreadable (%s), starting empty: %s", self._path, exc)
++            return
++        jobs = payload.get("jobs") if isinstance(payload, dict) else payload
++        for raw in jobs or []:
++            try:
++                job = Job.model_validate(raw)
++                self._jobs[job.id] = job
++            except Exception as exc:
++                logger.warning("skip corrupt job record: %s", exc)
++        ids = payload.get("processed_event_ids") if isinstance(payload, dict) else []
++        self.processed_event_ids = {str(item) for item in (ids or [])}
++
++    def _flush(self) -> None:
++        self._path.parent.mkdir(parents=True, exist_ok=True)
++        payload = {
++            "jobs": [job.model_dump(mode="json") for job in self._jobs.values()],
++            "processed_event_ids": sorted(self.processed_event_ids),
++        }
++        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
++        tmp.write_text(
++            json.dumps(payload, ensure_ascii=False, indent=2),
++            encoding="utf-8",
++        )
++        tmp.replace(self._path)
++
++    async def save(self, job: Job) -> None:
++        async with self._lock:
++            await super().save(job)
++            self._flush()
++
++    async def replace_processed_event_ids(self, ids: set[str]) -> None:
++        async with self._lock:
++            self.processed_event_ids = {str(item) for item in ids}
++            self._flush()
+diff --git a/adapters/telegram/handlers.py b/adapters/telegram/handlers.py
+index d8db818..04f1361 100644
+--- a/adapters/telegram/handlers.py
++++ b/adapters/telegram/handlers.py
+@@ -1,5 +1,7 @@
+ from __future__ import annotations
+ 
++import logging
++
+ from aiogram import F, Router
+ from aiogram.filters import Command, CommandStart
+ from aiogram.types import CallbackQuery, Message
+@@ -7,6 +9,8 @@ from aiogram.types import CallbackQuery, Message
+ from config.settings import Settings
+ from domain.errors import UserFacingError
+ 
++logger = logging.getLogger(__name__)
++
+ router = Router()
+ 
+ 
+@@ -106,22 +110,46 @@ class TelegramHandlers:
+         parts = data.split(":")
+         confirmed = len(parts) >= 2 and parts[1] == "confirm"
+         job_id = parts[2] if len(parts) >= 3 else ""
+-        if not job_id and callback.message:
+-            job_id = await self._job_id_for_chat(callback.message.chat.id)
+-        job = await self.jobs.get(job_id) if job_id else None
+-        chat_id = callback.message.chat.id if callback.message else None
+-        if job is None or (chat_id is not None and job.chat_id != chat_id):
+-            await callback.answer("Нет доступа.", show_alert=True)
+-            return
+-        if job.user_id and user_id is not None and job.user_id != user_id:
+-            await callback.answer("Нет доступа.", show_alert=True)
+-            return
++        answered = False
+         try:
++            if not job_id and callback.message:
++                job_id = await self._job_id_for_chat(callback.message.chat.id)
++            job = await self.jobs.get(job_id) if job_id else None
++            chat_id = callback.message.chat.id if callback.message else None
++            if job is None or (chat_id is not None and job.chat_id != chat_id):
++                await callback.answer("Нет доступа.", show_alert=True)
++                answered = True
++                return
++            if job.user_id and user_id is not None and job.user_id != user_id:
++                await callback.answer("Нет доступа.", show_alert=True)
++                answered = True
++                return
+             await self.orchestrator.confirm_merge(job_id, confirmed)
+         except UserFacingError as exc:
+-            if callback.message:
+-                await callback.message.answer(str(exc))
+-        await callback.answer()
++            try:
++                await callback.answer(str(exc)[:180], show_alert=True)
++                answered = True
++            except Exception:
++                if callback.message:
++                    await callback.message.answer(str(exc))
++        except Exception:
++            logger.exception("merge callback failed")
++            try:
++                await callback.answer(
++                    "Не удалось обработать подтверждение.", show_alert=True
++                )
++                answered = True
++            except Exception:
++                if callback.message:
++                    await callback.message.answer(
++                        "Не удалось обработать подтверждение."
++                    )
++        finally:
++            if not answered:
++                try:
++                    await callback.answer()
++                except Exception:
++                    pass
+ 
+ 
+ def register_handlers(dp, handlers: TelegramHandlers) -> None:
+diff --git a/app/container.py b/app/container.py
+index 973fdfe..942b088 100644
+--- a/app/container.py
++++ b/app/container.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ from adapters.coding_agent.adapter import CodingAgentAdapter
+ from adapters.github.adapter import GitHubAdapter
++from adapters.jobs.file_store import FileJobRepository
+ from adapters.jobs.memory import InMemoryJobRepository
+ from adapters.telegram.handlers import TelegramHandlers
+ from adapters.telegram.notifier import TelegramNotifier
+@@ -12,7 +13,11 @@ from orchestrator.pipeline_runner import PipelineRunner
+ class AppContainer:
+     def __init__(self, settings: Settings, *, bot=None) -> None:
+         self.settings = settings
+-        self.jobs = InMemoryJobRepository()
++        self.jobs = (
++            FileJobRepository(settings.jobs_store_path)
++            if settings.jobs_store_path
++            else InMemoryJobRepository()
++        )
+         self.github = GitHubAdapter(settings)
+         self.coding_agent = CodingAgentAdapter(self.github, settings)
+         self.notifier = TelegramNotifier(bot) if bot is not None else _NullNotifier()
+diff --git a/config/settings.py b/config/settings.py
+index 949f322..cdeacc7 100644
+--- a/config/settings.py
++++ b/config/settings.py
+@@ -30,6 +30,7 @@ class Settings(BaseSettings):
+     host: str = "0.0.0.0"
+     port: int = 8080
+     log_level: str = "INFO"
++    jobs_store_path: str = "data/jobs.json"
+ 
+     @property
+     def repository(self) -> str:
+diff --git a/docs/Acceptance_Test_Program.md b/docs/Acceptance_Test_Program.md
+index 33c2a4c..ac3a24f 100644
+--- a/docs/Acceptance_Test_Program.md
++++ b/docs/Acceptance_Test_Program.md
+@@ -48,5 +48,8 @@ Bot text does not claim an AI review that was not performed.
+ | PR-008 | No PR → clear text, no GitHub mutation |
+ | PR-009 | Telegram `send_document` error → PR/job unchanged |
+ | PR-010 | GitHub merge error → job not `DONE` |
++| PR-011 | Confirm after HEAD moved → no merge, must `/merge` again |
++| PR-012 | Process restart reloads jobs from `JOBS_STORE_PATH` and notifies the operator |
++| PR-013 | Merge callback without job_id still answers Telegram (button does not hang) |
+ 
+-Automated coverage: `tests/test_pr_review_control.py`, `tests/test_bug_regressions.py`.
++Automated coverage: `tests/test_pr_review_control.py`, `tests/test_bug_regressions.py`, `tests/test_review_followup.py`.
+diff --git a/docs/Architecture_Description.md b/docs/Architecture_Description.md
+index b93ea33..4f1f5ab 100644
+--- a/docs/Architecture_Description.md
++++ b/docs/Architecture_Description.md
+@@ -10,6 +10,8 @@ webhook / watch_issue  →  process_event()  →  Job FSM
+ 
+ `watch_issue` is a reserve for the webhook. Both sources share `process_event` and `processed_event_ids`. There is no second Telegram FSM. Job state is the only process model.
+ 
++On process start `recover_active_jobs()` reloads jobs from disk, restores processed event IDs, restarts watchers, and tells the operator the service came back. That is separate from BUG-001 (webhook drop inside a live process).
++
+ ## Layers
+ 
+ | Layer | Package | Responsibility |
+@@ -19,7 +21,7 @@ webhook / watch_issue  →  process_event()  →  Job FSM
+ | GitHub adapter | `adapters/github/` | Issues, PRs, comments, Actions, GraphQL assign |
+ | Coding agent | `adapters/coding_agent/` | assign, `@copilot` fix, webhook parse, poll |
+ | Telegram adapter | `adapters/telegram/` | commands and notifications only |
+-| Jobs | `adapters/jobs/` | in-memory store (persistence is out of scope) |
++| Jobs | `adapters/jobs/` | `FileJobRepository` (`JOBS_STORE_PATH`, default `data/jobs.json`); tests use in-memory |
+ | HTTP | `app/`, `webhooks/` | FastAPI lifespan, GitHub webhook router |
+ 
+ ## Job states
+diff --git a/docs/Detailed_Technical_Specification.md b/docs/Detailed_Technical_Specification.md
+index 41d25e5..55303ac 100644
+--- a/docs/Detailed_Technical_Specification.md
++++ b/docs/Detailed_Technical_Specification.md
+@@ -75,13 +75,14 @@ PR: <link>
+ [ Merge ]  [ Cancel ]
+ ```
+ 
+-Checks run on `/merge` and again on confirm:
++Checks run on `/merge` and again on confirm (TOCTOU):
+ 
+ - PR belongs to the current job
+ - PR is open and not merged
+ - required GitHub Actions completed successfully
+ - Copilot is not waiting for a user reply
+ - GitHub allows merge (`mergeable` / `mergeable_state`)
++- confirm merges the SHA frozen at `/merge`, not current HEAD; if the SHA changed, merge is denied and the operator must `/merge` again
+ 
+ Success moves the job to `DONE`. GitHub merge errors leave the job non-DONE.
+ 
+@@ -95,10 +96,11 @@ Success moves the job to `DONE`. GitHub merge errors leave the job non-DONE.
+ - Telegram adapter does not call GitHub API.
+ - Chain: Telegram → Adapter → Orchestrator → GitHubPort → GitHub Adapter → API.
+ - No separate Telegram FSM.
++- Jobs and processed event IDs are stored in `JOBS_STORE_PATH` so a process restart can recover in-flight work. Empty path keeps an in-memory store (tests).
+ 
+ ## Out of scope
+ 
+-Auto-merge, merge by PR number, automated AI review, persistent storage, branch deletion, a merge workflow.
++Auto-merge, merge by PR number, automated AI review, branch deletion, a merge workflow.
+ 
+ ## ISSUE-001
+ 
+diff --git a/orchestrator/pipeline_runner.py b/orchestrator/pipeline_runner.py
+index 1231418..1da47ea 100644
+--- a/orchestrator/pipeline_runner.py
++++ b/orchestrator/pipeline_runner.py
+@@ -193,11 +193,13 @@ class PipelineRunner:
+             return
+         if job.state in JobState.terminal():
+             self.processed_event_ids.add(event.event_id)
++            await self._persist_event_ids()
+             return
+         self.processed_event_ids.add(event.event_id)
+         if len(self.processed_event_ids) > 10_000:
+             self.processed_event_ids.clear()
+             self.processed_event_ids.add(event.event_id)
++        self._sync_event_ids_to_repo()
+         job.last_event_at = utcnow()
+         self._stale_notified.discard(job.id)
+         self._watch_error_notified.discard(job.id)
+@@ -328,7 +330,16 @@ class PipelineRunner:
+         await self._enter_terminal(job, JobState.DONE)
+ 
+     async def recover_active_jobs(self) -> None:
++        stored = getattr(self.jobs, "processed_event_ids", None)
++        if stored:
++            self.processed_event_ids |= set(stored)
+         for job in await self.jobs.list_non_terminal():
++            if job.issue_number:
++                await self.notifier.send_text(
++                    job.chat_id,
++                    "Сервис перезапущен. Продолжаю следить за задачей.\n"
++                    f"{job.issue_url or job.pr_url}".strip(),
++                )
+             if job.state == JobState.TASK_ACCEPTED:
+                 await self._process_state(job)
+             if job.state in (
+@@ -447,11 +458,7 @@ class PipelineRunner:
+             return
+         if not confirmed:
+             if job.state == JobState.MERGE_CONFIRMATION_PENDING:
+-                job.state = job.state_before_merge or (
+-                    JobState.TEST_PASSED if job.pipeline_check_posted else JobState.WAIT_TESTS
+-                )
+-                job.state_before_merge = None
+-                await self.jobs.save(job)
++                await self._revert_merge_pending(job)
+             await self.notifier.send_text(job.chat_id, "Merge отменён.")
+             return
+         decision = await self._evaluate_merge(job)
+@@ -464,9 +471,17 @@ class PipelineRunner:
+         if not decision.allowed:
+             await self.notifier.send_text(job.chat_id, decision.message)
+             return
++        pinned = job.merge_head_sha
++        if pinned and decision.head_sha and pinned != decision.head_sha:
++            await self._revert_merge_pending(job)
++            await self.notifier.send_text(
++                job.chat_id,
++                "PR изменился с момента /merge. Повторите /merge.",
++            )
++            return
+         try:
+             await self.github.merge_pull_request(
+-                job.repository, job.pr_number, sha=decision.head_sha
++                job.repository, job.pr_number, sha=pinned or decision.head_sha
+             )
+         except MergeError as exc:
+             await self.notifier.send_text(
+@@ -519,6 +534,25 @@ class PipelineRunner:
+             ci_label="PASS",
+         )
+ 
++    async def _revert_merge_pending(self, job: Job) -> None:
++        job.state = job.state_before_merge or (
++            JobState.TEST_PASSED if job.pipeline_check_posted else JobState.WAIT_TESTS
++        )
++        job.state_before_merge = None
++        job.merge_head_sha = None
++        await self.jobs.save(job)
++
++    def _sync_event_ids_to_repo(self) -> None:
++        stored = getattr(self.jobs, "processed_event_ids", None)
++        if isinstance(stored, set):
++            stored.clear()
++            stored.update(self.processed_event_ids)
++
++    async def _persist_event_ids(self) -> None:
++        persist = getattr(self.jobs, "replace_processed_event_ids", None)
++        if persist is not None:
++            await persist(self.processed_event_ids)
++
+     def _copilot_awaits_user(self, job: Job) -> bool:
+         return bool(job.awaiting_user_reply)
+ 
+diff --git a/tests/test_pr_review_control.py b/tests/test_pr_review_control.py
+index d570b3d..63240be 100644
+--- a/tests/test_pr_review_control.py
++++ b/tests/test_pr_review_control.py
+@@ -75,7 +75,12 @@ async def test_pr004_confirm_merge_sets_done(harness):
+         harness["runner"],
+         harness["notifier"],
+     )
+-    job = await seed_job(jobs, state=JobState.MERGE_CONFIRMATION_PENDING)
++    job = await seed_job(
++        jobs,
++        state=JobState.MERGE_CONFIRMATION_PENDING,
++        merge_head_sha="abc123",
++        state_before_merge=JobState.WAIT_TESTS,
++    )
+     store.prs[12] = open_pr()
+     store.runs["copilot/fix-12"] = [
+         {"id": 1, "status": "completed", "conclusion": "success"}
+@@ -169,7 +174,12 @@ async def test_pr009_telegram_document_failure_does_not_change_job(harness):
+ 
+ async def test_pr010_github_merge_failure_does_not_mark_done(harness):
+     jobs, store, runner = harness["jobs"], harness["store"], harness["runner"]
+-    job = await seed_job(jobs, state=JobState.MERGE_CONFIRMATION_PENDING)
++    job = await seed_job(
++        jobs,
++        state=JobState.MERGE_CONFIRMATION_PENDING,
++        merge_head_sha="abc123",
++        state_before_merge=JobState.WAIT_TESTS,
++    )
+     store.prs[12] = open_pr()
+     store.runs["copilot/fix-12"] = [
+         {"id": 1, "status": "completed", "conclusion": "success"}
+diff --git a/tests/test_review_followup.py b/tests/test_review_followup.py
+new file mode 100644
+index 0000000..b6f70b5
+--- /dev/null
++++ b/tests/test_review_followup.py
+@@ -0,0 +1,179 @@
++"""Review follow-up: disk jobs, frozen merge SHA, callback always answers."""
++
++from __future__ import annotations
++
++from types import SimpleNamespace
++
++from adapters.jobs.file_store import FileJobRepository
++from adapters.telegram.handlers import TelegramHandlers
++from config.settings import Settings
++from domain.models import EventType, Job, JobState, PipelineEvent
++from orchestrator.pipeline_runner import PipelineRunner
++from tests.conftest import FakeCodingAgent, FakeGitHub, FakeNotifier, FakePRStore, open_pr, seed_job
++
++
++async def test_file_store_survives_reload(tmp_path):
++    path = tmp_path / "jobs.json"
++    repo = FileJobRepository(path)
++    job = Job(
++        chat_id=100,
++        user_id=7,
++        repository="acme/repo",
++        title="task",
++        body="do the thing",
++        state=JobState.WAIT_TESTS,
++        issue_number=3,
++        issue_url="https://github.com/acme/repo/issues/3",
++        pr_number=12,
++        merge_head_sha="abc123",
++    )
++    await repo.save(job)
++    await repo.replace_processed_event_ids({"comment-started-99"})
++
++    reloaded = FileJobRepository(path)
++    loaded = await reloaded.get(job.id)
++    assert loaded is not None
++    assert loaded.state == JobState.WAIT_TESTS
++    assert loaded.pr_number == 12
++    assert loaded.merge_head_sha == "abc123"
++    assert "comment-started-99" in reloaded.processed_event_ids
++    live = await reloaded.list_non_terminal()
++    assert [item.id for item in live] == [job.id]
++
++
++async def test_file_store_skips_corrupt_file(tmp_path):
++    path = tmp_path / "jobs.json"
++    path.write_text("{not-json", encoding="utf-8")
++    repo = FileJobRepository(path)
++    assert await repo.list_non_terminal() == []
++    job = Job(
++        chat_id=1,
++        user_id=1,
++        repository="acme/repo",
++        title="t",
++        body="b",
++    )
++    await repo.save(job)
++    assert (await FileJobRepository(path).get(job.id)) is not None
++
++
++async def test_recover_after_restart_reloads_jobs_and_notifies(tmp_path, settings):
++    path = tmp_path / "jobs.json"
++    first = FileJobRepository(path)
++    job = await seed_job(first, state=JobState.CODING_AGENT_RUNNING)
++    store = FakePRStore()
++    notifier = FakeNotifier()
++    runner = PipelineRunner(
++        settings=settings,
++        jobs=first,
++        github=FakeGitHub(store),
++        coding_agent=FakeCodingAgent(),
++        notifier=notifier,
++    )
++    await runner.process_event(
++        PipelineEvent(
++            event_id="comment-started-1",
++            type=EventType.AGENT_STARTED,
++            issue_number=3,
++        )
++    )
++
++    second_jobs = FileJobRepository(path)
++    second_notifier = FakeNotifier()
++    restarted = PipelineRunner(
++        settings=settings,
++        jobs=second_jobs,
++        github=FakeGitHub(FakePRStore()),
++        coding_agent=FakeCodingAgent(),
++        notifier=second_notifier,
++    )
++    await restarted.recover_active_jobs()
++
++    live = await second_jobs.list_non_terminal()
++    assert len(live) == 1
++    assert live[0].id == job.id
++    assert live[0].state == JobState.CODING_AGENT_RUNNING
++    assert "comment-started-1" in restarted.processed_event_ids
++    assert any("перезапущен" in text for _, text in second_notifier.texts)
++    assert job.id in restarted._watch_tasks
++
++
++async def test_confirm_merge_uses_frozen_sha_and_rejects_head_move(harness):
++    jobs, store, runner, notifier = (
++        harness["jobs"],
++        harness["store"],
++        harness["runner"],
++        harness["notifier"],
++    )
++    job = await seed_job(jobs)
++    store.prs[12] = open_pr(head_sha="abc123")
++    store.runs["copilot/fix-12"] = [
++        {"id": 1, "status": "completed", "conclusion": "success"}
++    ]
++
++    await runner.request_merge(job.id)
++    store.prs[12].head_sha = "fff999"
++    await runner.confirm_merge(job.id, True)
++
++    assert store.merge_calls == []
++    fresh = await jobs.get(job.id)
++    assert fresh.state == JobState.WAIT_TESTS
++    assert fresh.merge_head_sha is None
++    assert any("изменился" in text and "/merge" in text for _, text in notifier.texts)
++
++
++async def test_confirm_merge_sends_frozen_sha_not_later_head(harness):
++    jobs, store, runner = harness["jobs"], harness["store"], harness["runner"]
++    job = await seed_job(
++        jobs,
++        state=JobState.MERGE_CONFIRMATION_PENDING,
++        merge_head_sha="pinned-sha",
++        state_before_merge=JobState.TEST_PASSED,
++    )
++    store.prs[12] = open_pr(head_sha="pinned-sha")
++    store.runs["copilot/fix-12"] = [
++        {"id": 1, "status": "completed", "conclusion": "success"}
++    ]
++
++    await runner.confirm_merge(job.id, True)
++
++    assert store.merge_calls == [
++        {"repository": "acme/repo", "number": 12, "sha": "pinned-sha"}
++    ]
++
++
++class _Callback:
++    def __init__(self, *, data: str, chat_id: int = 100, user_id: int = 7) -> None:
++        self.data = data
++        self.from_user = SimpleNamespace(id=user_id)
++        self.message = SimpleNamespace(chat=SimpleNamespace(id=chat_id), answers=[])
++        self.answers: list[dict] = []
++
++        async def _message_answer(text: str) -> None:
++            self.message.answers.append(text)
++
++        self.message.answer = _message_answer
++
++    async def answer(self, text: str = "", show_alert: bool = False) -> None:
++        self.answers.append({"text": text, "alert": show_alert})
++
++
++async def test_merge_callback_answers_when_job_id_lookup_fails():
++    from adapters.jobs.memory import InMemoryJobRepository
++
++    jobs = InMemoryJobRepository()
++    settings = Settings(telegram_allowed_user_ids="7")
++    calls: list[tuple] = []
++
++    class _Orch:
++        async def confirm_merge(self, job_id: str, confirmed: bool) -> None:
++            calls.append((job_id, confirmed))
++
++    handlers = TelegramHandlers(_Orch(), jobs, settings)
++    callback = _Callback(data="merge:confirm")
++    await handlers.on_merge_callback(callback)
++
++    assert calls == []
++    assert callback.answers
++    assert callback.answers[0]["alert"] is True
++    assert "Нет активной задачи" in callback.answers[0]["text"]

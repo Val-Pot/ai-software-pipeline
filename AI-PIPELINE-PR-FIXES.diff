@@ -1,0 +1,713 @@
+From: pipeline-fix
+Date: Sun, 16 Aug 2026 01:08:00 +0300
+Subject: [PATCH] AI Software Pipeline: BUG-001..011 + PIPE-PR-001 /diff /merge
+
+Почему ломается, как чинить, готовое решение.
+Основание: ТЗ на дефекты (BUG-001…011, ISSUE-001) + ТЗ PIPE-PR-001.
+Исходников в этом репозитории нет — hunks собраны по описанию багов.
+
+Корневая причина
+----------------
+Между «агент запущен» и «тесты прошли» оркестратор ждёт только
+GitHub webhook через process_event(). Нет события, кривой формат
+или ложный успех — job зависает или идёт дальше по фальшивому сигналу.
+
+PR-001 чинит слепоту и ложные сигналы.
+PR-002 добавляет /diff и /merge, не превращая Telegram во второй GitHub.
+
+ISSUE-001 (нет .github/workflows/ в целевом репо) — не баг пайплайна,
+в этот diff не входит.
+
+---
+ config/settings.py                         |  12 ++++----
+ .env.example                               |   8 +++++-
+ orchestrator/pipeline_runner.py            | 180 ++++++++++++++++++++++++++++-
+ app/lifespan.py                            |  10 +++++++
+ adapters/coding_agent/adapter.py           |  70 +++++++++++++++++-----
+ adapters/github/adapter.py                 |  28 ++++------
+ adapters/github/issues.py                  |  75 +++++++++++++++++++++----
+ adapters/github/models.py                  |   4 ++
+ adapters/github/actions.py                 |  14 ++++-
+ adapters/github/agent_models.py            |   6 ++--
+ adapters/coding_agent/models.py            |   2 +-
+ ports/github.py                            |   6 ++
+ ports/notifier.py                          |  10 ++++
+ adapters/telegram/handlers.py              |  40 ++++++++++++++
+ tests/test_pr_review_control.py            |  80 ++++++++++++++++++++++++++++
+ github/actions_monitor.py                  |   0
+ github/copilot_trigger.py                  |   0
+ github/issue_factory.py                    |   0
+ github/pr_monitor.py                       |   0
+ github/review.py                           |   0
+ webhooks/handlers/issue_handler.py         |   0
+ webhooks/handlers/pr_handler.py            |   0
+ webhooks/handlers/actions_handler.py       |   0
+ webhooks/handlers/__init__.py              |  20 -------
+ docs/Detailed_Technical_Specification.md   |  18 ++++++
+ docs/Architecture_Description.md           |  12 ++++
+ docs/Acceptance_Test_Program.md            |  16 ++++++
+ README.md                                  |  18 ++++++
+ 28 files changed, ~600 insertions(+), ~80 deletions(-)
+
+diff --git a/config/settings.py b/config/settings.py
+index 1111111..2222222 100644
+--- a/config/settings.py
++++ b/config/settings.py
+@@
+-    copilot_username: str = "github-copilot[bot]"
++    # Один официальный логин coding agent (назначение + комментарии + PR).
++    # Предположение про отдельный github-copilot[bot] — ошибочное, не используем.
++    copilot_username: str = "copilot-swe-agent[bot]"
++    coding_agent_stale_timeout_sec: int = 1800
++    coding_agent_poll_interval_sec: int = 30
++    coding_agent_poll_timeout_sec: int = 21600
++    telegram_max_document_bytes: int = 50 * 1024 * 1024
+
+diff --git a/.env.example b/.env.example
+index 1111111..2222222 100644
+--- a/.env.example
++++ b/.env.example
+@@
+-COPILOT_USERNAME=github-copilot[bot]
++COPILOT_USERNAME=copilot-swe-agent[bot]
++
++# Предупреждение, если job в CODING_AGENT_RUNNING / WAIT_TESTS
++# без событий дольше порога. Job в terminal не переводится.
++CODING_AGENT_STALE_TIMEOUT_SEC=1800
++CODING_AGENT_POLL_INTERVAL_SEC=30
++CODING_AGENT_POLL_TIMEOUT_SEC=21600
++TELEGRAM_MAX_DOCUMENT_BYTES=52428800
+
+diff --git a/orchestrator/pipeline_runner.py b/orchestrator/pipeline_runner.py
+index 1111111..2222222 100644
+--- a/orchestrator/pipeline_runner.py
++++ b/orchestrator/pipeline_runner.py
+@@
++# BUG-001: webhook — не единственный источник событий.
++# watch_issue() уже реализован, но раньше нигде не запускался.
++# События поллинга идут в process_event() (processed_event_ids).
++
+     def __init__(self, ...):
++        self._watch_tasks: dict[str, asyncio.Task] = {}
++        self._watchdog_tasks: dict[str, asyncio.Task] = {}
++        self._stale_notified: set[str] = set()
+         ...
+ 
+     async def _process_state(self, job):
+         if job.state == JobState.TASK_ACCEPTED:
+             await self.trigger_coding_agent(job)
+             job.state = JobState.CODING_AGENT_RUNNING
+             await self.jobs.save(job)
++            self._ensure_watchers(job)
+             return
+         if job.state == JobState.TEST_PASSED:
+             ...
++        # CODING_AGENT_RUNNING / WAIT_TESTS: прогресс только через process_event()
++
++    def _ensure_watchers(self, job) -> None:
++        if job.state in JobState.terminal():
++            return
++        if job.id not in self._watch_tasks or self._watch_tasks[job.id].done():
++            self._watch_tasks[job.id] = asyncio.create_task(
++                self._run_watch_issue(job),
++                name=f"watch-issue-{job.id}",
++            )
++        if job.id not in self._watchdog_tasks or self._watchdog_tasks[job.id].done():
++            self._watchdog_tasks[job.id] = asyncio.create_task(
++                self._run_stale_watchdog(job),
++                name=f"stale-watchdog-{job.id}",
++            )
++
++    async def _run_watch_issue(self, job) -> None:
++        try:
++            async for event in self.coding_agent.watch_issue(job.issue_number):
++                fresh = await self.jobs.get(job.id)
++                if fresh is None or fresh.state in JobState.terminal():
++                    return
++                await self.process_event(event)
++        except asyncio.CancelledError:
++            raise
++        except Exception as exc:
++            await self.notifier.send_text(
++                job.chat_id,
++                f"Ошибка резервного опроса GitHub: {exc}\n"
++                f"Проверьте issue вручную: {job.issue_url}",
++            )
++
++    async def _run_stale_watchdog(self, job) -> None:
++        timeout = self.settings.coding_agent_stale_timeout_sec
++        while True:
++            await asyncio.sleep(min(60, timeout))
++            fresh = await self.jobs.get(job.id)
++            if fresh is None or fresh.state in JobState.terminal():
++                return
++            if fresh.state not in (JobState.CODING_AGENT_RUNNING, JobState.WAIT_TESTS):
++                continue
++            last = fresh.last_event_at or fresh.updated_at
++            silent_for = (utcnow() - last).total_seconds()
++            if silent_for >= timeout and job.id not in self._stale_notified:
++                minutes = int(silent_for // 60)
++                await self.notifier.send_text(
++                    fresh.chat_id,
++                    f"Нет новостей от GitHub уже {minutes} минут, "
++                    f"проверьте issue вручную: {fresh.issue_url}",
++                )
++                self._stale_notified.add(job.id)
++
+     async def process_event(self, event) -> None:
+         if event.event_id in self.processed_event_ids:
+             return
+         self.processed_event_ids.add(event.event_id)
++        job = await self.jobs.find_by_event(event)
++        if job:
++            job.last_event_at = utcnow()
++            await self.jobs.save(job)
+         ...
+ 
+     async def _handle_test_failure(self, job, error_log: str) -> None:
+-        await self.github.trigger_fix(job.issue_number, error_log)
++        # BUG-002 + BUG-003: единственный путь — подтверждённая команда @copilot
++        await self.coding_agent.trigger_fix_iteration(job.issue_number, error_log)
+ 
+     async def recover_active_jobs(self) -> None:
+-        for job in await self.jobs.list_non_terminal():
+-            await self._process_state(job)
++        for job in await self.jobs.list_non_terminal():
++            if job.state in (JobState.TASK_ACCEPTED, JobState.TEST_PASSED):
++                await self._process_state(job)
++            if job.state in (
++                JobState.CODING_AGENT_RUNNING,
++                JobState.WAIT_TESTS,
++                JobState.MERGE_CONFIRMATION_PENDING,
++            ):
++                self._ensure_watchers(job)
++
++    def _bound_pr(self, job):
++        if not job.pr_number:
++            raise UserFacingError("Для текущей задачи Pull Request ещё не создан.")
++        return job
++
++    async def request_diff(self, job_id: str) -> None:
++        job = await self.jobs.get(job_id)
++        self._bound_pr(job)
++        pr = await self.github.get_pull_request(job.pr_number)
++        if pr.merged:
++            await self.notifier.send_text(job.chat_id, "Pull Request уже объединён.")
++            return
++        if pr.state == "closed":
++            await self.notifier.send_text(
++                job.chat_id, "Pull Request закрыт. Актуальный diff недоступен."
++            )
++            return
++        try:
++            diff = await self.github.get_pull_request_diff(job.repository, job.pr_number)
++        except Exception:
++            await self.notifier.send_text(
++                job.chat_id,
++                "Не удалось получить diff Pull Request.\n"
++                "Попробуйте повторить команду позже.",
++            )
++            return
++        if not (diff or "").strip():
++            await self.notifier.send_text(
++                job.chat_id,
++                "В Pull Request нет изменений для передачи на ревью.",
++            )
++            return
++        data = diff.encode("utf-8")
++        if len(data) > self.settings.telegram_max_document_bytes:
++            await self.notifier.send_text(
++                job.chat_id,
++                "Diff сформирован, но его размер превышает лимит Telegram.\n"
++                f"PR: {pr.html_url}",
++            )
++            return
++        try:
++            await self.notifier.send_document(
++                job.chat_id,
++                filename=f"PR-{job.pr_number}.diff",
++                content=data,
++                caption=f"PR #{job.pr_number} — актуальный diff для ревью",
++            )
++        except Exception:
++            await self.notifier.send_text(
++                job.chat_id,
++                "Не удалось отправить diff в Telegram.\n"
++                f"PR: {pr.html_url}",
++            )
++
++    async def request_merge(self, job_id: str) -> None:
++        job = await self.jobs.get(job_id)
++        self._bound_pr(job)
++        decision = await self._evaluate_merge(job)
++        if decision.already_merged:
++            await self.notifier.send_text(
++                job.chat_id, f"PR #{job.pr_number} уже объединён."
++            )
++            return
++        if not decision.allowed:
++            await self.notifier.send_text(job.chat_id, decision.message)
++            return
++        job.state = JobState.MERGE_CONFIRMATION_PENDING
++        job.merge_head_sha = decision.head_sha
++        await self.jobs.save(job)
++        await self.notifier.send_merge_confirmation(
++            job.chat_id,
++            job.id,
++            f"PR #{job.pr_number}\n\n"
++            f"Status: OPEN\nCI: {decision.ci_label}\nPR: {decision.pr_url}\n\n"
++            f"Объединить Pull Request?",
++        )
++
++    async def confirm_merge(self, job_id: str, confirmed: bool) -> None:
++        job = await self.jobs.get(job_id)
++        if not confirmed:
++            if job.state == JobState.MERGE_CONFIRMATION_PENDING:
++                job.state = JobState.WAIT_TESTS if job.pr_number else job.state
++                await self.jobs.save(job)
++            await self.notifier.send_text(job.chat_id, "Merge отменён.")
++            return
++        decision = await self._evaluate_merge(job)
++        if decision.already_merged:
++            await self.notifier.send_text(
++                job.chat_id, f"PR #{job.pr_number} уже объединён."
++            )
++            return
++        if not decision.allowed:
++            await self.notifier.send_text(job.chat_id, decision.message)
++            return
++        try:
++            await self.github.merge_pull_request(
++                job.repository, job.pr_number, sha=decision.head_sha
++            )
++        except MergeError as exc:
++            await self.notifier.send_text(
++                job.chat_id,
++                f"Не удалось выполнить merge PR #{job.pr_number}.\n\n"
++                f"Причина: {exc.reason}",
++            )
++            return
++        job.state = JobState.DONE
++        await self.jobs.save(job)
++        await self.notifier.send_text(
++            job.chat_id,
++            f"PR #{job.pr_number} успешно объединён.\n\n"
++            f"Задача завершена.\n{job.pr_url}",
++        )
++
++    async def _evaluate_merge(self, job) -> MergeDecision:
++        if not job.pr_number:
++            return MergeDecision.deny("Для текущей задачи Pull Request ещё не создан.")
++        pr = await self.github.get_pull_request(job.pr_number)
++        if pr.merged:
++            return MergeDecision(
++                already_merged=True,
++                allowed=False,
++                message=f"PR #{pr.number} уже объединён.",
++            )
++        if pr.state == "closed":
++            return MergeDecision.deny("PR закрыт и не может быть объединён.")
++        if self._copilot_awaits_user(job):
++            return MergeDecision.deny(
++                "Merge пока невозможен: Copilot ожидает ответа пользователя."
++            )
++        ci = await self._fresh_ci_status(pr)
++        if ci in ("pending", "running"):
++            return MergeDecision.deny(
++                "Merge пока невозможен: проверки CI ещё выполняются."
++            )
++        if ci == "failure":
++            return MergeDecision.deny("Merge невозможен: CI завершился с ошибкой.")
++        if pr.mergeable is False or (
++            pr.mergeable_state and pr.mergeable_state not in ("clean", "unstable")
++        ):
++            return MergeDecision.deny(
++                f"GitHub не разрешает merge данного PR "
++                f"(mergeable_state={pr.mergeable_state})."
++            )
++        return MergeDecision(
++            allowed=True,
++            head_sha=pr.head_sha,
++            pr_url=pr.html_url,
++            ci_label="PASS",
++        )
+
+diff --git a/app/lifespan.py b/app/lifespan.py
+index 1111111..2222222 100644
+--- a/app/lifespan.py
++++ b/app/lifespan.py
+@@
+     async def lifespan(app):
+         await runner.recover_active_jobs()
+         yield
++        for task in list(runner._watch_tasks.values()) + list(runner._watchdog_tasks.values()):
++            task.cancel()
+
+diff --git a/adapters/coding_agent/adapter.py b/adapters/coding_agent/adapter.py
+index 1111111..2222222 100644
+--- a/adapters/coding_agent/adapter.py
++++ b/adapters/coding_agent/adapter.py
+@@
+-_FIX_TRIGGER_TEXT = "@copilot fix the failing tests"
++_FIX_TRIGGER_TEXT = "@copilot Fix the failing tests"
++
++    async def trigger_fix_iteration(self, issue_number: int, error_log: str) -> None:
++        body = f"{_FIX_TRIGGER_TEXT}\n\n```\n{error_log.strip()}\n```"
++        await self.github.comments.create_issue_comment(issue_number, body)
+ 
+-        if "copilot" in user_login.lower():
++    def _is_coding_agent_login(self, login: str) -> bool:
++        from adapters.github.issues import _COPILOT_ASSIGNEE_ALIASES
++        allowed = {alias.lower() for alias in _COPILOT_ASSIGNEE_ALIASES}
++        return (login or "").strip().lower() in allowed
++
++        if self._is_coding_agent_login(user_login):
+             ...
+ 
+     async def detect_task_completion(self, issue_number: int, pr_number: int | None) -> bool:
++        if pr_number:
++            pr = await self.github.pull_requests.get_pull_request(pr_number)
++            if pr.draft is False or pr.requested_reviewers:
++                return True
+         if await self._issue_is_closed(issue_number):
+             return True
+         comments = await self.github.comments.list_issue_comments(issue_number)
+-        return any(self._looks_like_completion_text(c.body) for c in comments)
++        return any(
++            self._looks_like_completion_text(c.body)
++            for c in comments
++            if self._is_coding_agent_login(c.user.login)
++        )
+
+diff --git a/adapters/github/adapter.py b/adapters/github/adapter.py
+index 1111111..2222222 100644
+--- a/adapters/github/adapter.py
++++ b/adapters/github/adapter.py
+@@
+-    async def trigger_fix(self, issue_number: int, error_log: str) -> None:
+-        await self.comments.create_issue_comment(
+-            issue_number,
+-            f"@{self.copilot_username} Please analyze the test failure log above and push a fix.",
+-        )
++    # trigger_fix удалён (BUG-002 / BUG-003).
++    # Единственный путь: coding_agent.trigger_fix_iteration
++    # с текстом "@copilot Fix the failing tests".
+ 
+     async def run_ai_review(self, pull_request_number: int) -> None:
+         await self.comments.create_pr_comment(
+             pull_request_number,
+-            "Automated AI Review Summary\n\nApproved for Merge ✅",
++            "Pipeline check: CI passed, no automated review configured.",
+         )
++
++    async def get_pull_request_diff(self, repository: str, pull_request_number: int) -> str:
++        return await self.pull_requests.get_pull_request_diff(pull_request_number)
++
++    async def merge_pull_request(
++        self, repository: str, pull_request_number: int, *, sha: str | None = None
++    ) -> dict:
++        return await self.pull_requests.merge_pull_request(pull_request_number, sha=sha)
+
+diff --git a/adapters/github/issues.py b/adapters/github/issues.py
+index 1111111..2222222 100644
+--- a/adapters/github/issues.py
++++ b/adapters/github/issues.py
+@@
+-# Агент комментирует как github-copilot[bot], а назначается как copilot-swe-agent[bot]
+-_COPILOT_ASSIGNEE = "github-copilot[bot]"
++# Агент использует один логин copilot-swe-agent[bot]
++# и для назначения, и для комментариев/PR.
++# Предположение про отдельный github-copilot[bot] — ошибочное, не используем.
++_COPILOT_ASSIGNEE = "copilot-swe-agent[bot]"
+ _COPILOT_ASSIGNEE_ALIASES = frozenset({
+     "copilot-swe-agent[bot]",
+     "copilot-swe-agent",
+ })
+ 
+     async def assign_copilot(self, issue_number: int):
+         resp = await self._http.post(
+             f"/repos/{self._owner}/{self._repo}/issues/{issue_number}/assignees",
+             json={"assignees": [_COPILOT_ASSIGNEE]},
+         )
+-        return
++        body = resp.json()
++        assignees = body.get("assignees") or []
++        if self._assignees_include_copilot(assignees):
++            return body
++        graphql_body = await self._assign_via_graphql(issue_number)
++        if graphql_body and self._assignees_include_copilot(
++            graphql_body.get("assignees") or []
++        ):
++            return graphql_body
++        raise AssignmentError(
++            f"GitHub принял запрос, но не назначил {_COPILOT_ASSIGNEE}. "
++            "Включите Copilot coding agent и проверьте права токена."
++        )
++
++    def _assignees_include_copilot(self, assignees) -> bool:
++        allowed = {alias.lower() for alias in _COPILOT_ASSIGNEE_ALIASES}
++        for item in assignees:
++            login = item.get("login") if isinstance(item, dict) else str(item)
++            if (login or "").lower() in allowed:
++                return True
++        return False
++
++    async def _assign_via_graphql(self, issue_number: int):
++        if self._graphql is None:
++            return None
++        try:
++            issue_id, actor_id = await self._graphql.resolve_assignable_and_actor(
++                owner=self._owner,
++                repo=self._repo,
++                issue_number=issue_number,
++                actor_login=_COPILOT_ASSIGNEE,
++            )
++            data = await self._graphql.execute(
++                """
++                mutation($assignableId: ID!, $actorIds: [ID!]!) {
++                  replaceActorsForAssignable(input: {
++                    assignableId: $assignableId, actorIds: $actorIds
++                  }) {
++                    assignable {
++                      ... on Issue {
++                        assignees(first: 10) { nodes { login } }
++                      }
++                    }
++                  }
++                }
++                """,
++                {"assignableId": issue_id, "actorIds": [actor_id]},
++            )
++            nodes = (
++                data.get("replaceActorsForAssignable", {})
++                .get("assignable", {})
++                .get("assignees", {})
++                .get("nodes")
++                or []
++            )
++            return {"assignees": nodes}
++        except Exception:
++            return None
+
+diff --git a/adapters/github/models.py b/adapters/github/models.py
+index 1111111..2222222 100644
+--- a/adapters/github/models.py
++++ b/adapters/github/models.py
+@@
+ class GitHubPullRequest(BaseModel):
+     number: int
+     html_url: str
+     state: str
++    draft: bool = False
++    requested_reviewers: list[GitHubUser] = []
+     merged: bool = False
+
+diff --git a/adapters/github/actions.py b/adapters/github/actions.py
+index 1111111..2222222 100644
+--- a/adapters/github/actions.py
++++ b/adapters/github/actions.py
+@@
+     async def get_latest_run_for_branch(self, branch: str):
+-        resp = await self._http.get(..., params={"branch": branch, "per_page": 1})
+-        runs = resp.json().get("workflow_runs") or []
+-        return runs[0] if runs else None
++        resp = await self._http.get(
++            f"/repos/{self._owner}/{self._repo}/actions/runs",
++            params={"branch": branch, "per_page": 10},
++        )
++        runs = resp.json().get("workflow_runs") or []
++        for run in runs:
++            if (run.get("status") or "").lower() == "completed":
++                return run
++        return None
+
+diff --git a/adapters/github/agent_models.py b/adapters/github/agent_models.py
+index 1111111..2222222 100644
+--- a/adapters/github/agent_models.py
++++ b/adapters/github/agent_models.py
+@@
+-COPILOT_CODING_AGENT_LOGIN = "github-copilot[bot]"
++COPILOT_CODING_AGENT_LOGIN = "copilot-swe-agent[bot]"
+
+diff --git a/adapters/coding_agent/models.py b/adapters/coding_agent/models.py
+index 1111111..2222222 100644
+--- a/adapters/coding_agent/models.py
++++ b/adapters/coding_agent/models.py
+@@
+-DEFAULT_COPILOT_LOGIN = "github-copilot[bot]"
++DEFAULT_COPILOT_LOGIN = "copilot-swe-agent[bot]"
+
+diff --git a/ports/github.py b/ports/github.py
+index 1111111..2222222 100644
+--- a/ports/github.py
++++ b/ports/github.py
+@@
+ class GitHubPort(Protocol):
+     async def get_pull_request(self, pull_request_number: int) -> GitHubPullRequest: ...
++    async def get_pull_request_diff(self, repository: str, pull_request_number: int) -> str: ...
++    async def merge_pull_request(
++        self, repository: str, pull_request_number: int, *, sha: str | None = None
++    ) -> dict: ...
+
+diff --git a/ports/notifier.py b/ports/notifier.py
+index 1111111..2222222 100644
+--- a/ports/notifier.py
++++ b/ports/notifier.py
+@@
+ class NotifierPort(Protocol):
+     async def send_text(self, chat_id: int, text: str) -> None: ...
++    async def send_document(
++        self, chat_id: int, filename: str, content: bytes, caption: str = ""
++    ) -> None: ...
++    async def send_merge_confirmation(
++        self, chat_id: int, job_id: str, text: str
++    ) -> None: ...
+
+diff --git a/adapters/telegram/handlers.py b/adapters/telegram/handlers.py
+index 1111111..2222222 100644
+--- a/adapters/telegram/handlers.py
++++ b/adapters/telegram/handlers.py
+@@
++    # Только авторизованные пользователи. Номер PR из команды не принимается.
++    async def on_diff(self, update) -> None:
++        await self.orchestrator.request_diff(job_id=update.current_job_id)
++
++    async def on_merge(self, update) -> None:
++        await self.orchestrator.request_merge(job_id=update.current_job_id)
++
++    async def on_merge_callback(self, update) -> None:
++        confirmed = update.callback_data == "merge:confirm"
++        await self.orchestrator.confirm_merge(update.current_job_id, confirmed)
+
+diff --git a/github/actions_monitor.py b/github/actions_monitor.py
+deleted file mode 100644
+index e69de29..0000000
+--- a/github/actions_monitor.py
++++ /dev/null
+@@
+diff --git a/github/copilot_trigger.py b/github/copilot_trigger.py
+deleted file mode 100644
+index e69de29..0000000
+--- a/github/copilot_trigger.py
++++ /dev/null
+@@
+diff --git a/github/issue_factory.py b/github/issue_factory.py
+deleted file mode 100644
+index e69de29..0000000
+--- a/github/issue_factory.py
++++ /dev/null
+@@
+diff --git a/github/pr_monitor.py b/github/pr_monitor.py
+deleted file mode 100644
+index e69de29..0000000
+--- a/github/pr_monitor.py
++++ /dev/null
+@@
+diff --git a/github/review.py b/github/review.py
+deleted file mode 100644
+index e69de29..0000000
+--- a/github/review.py
++++ /dev/null
+@@
+diff --git a/webhooks/handlers/issue_handler.py b/webhooks/handlers/issue_handler.py
+deleted file mode 100644
+index e69de29..0000000
+--- a/webhooks/handlers/issue_handler.py
++++ /dev/null
+@@
+diff --git a/webhooks/handlers/pr_handler.py b/webhooks/handlers/pr_handler.py
+deleted file mode 100644
+index e69de29..0000000
+--- a/webhooks/handlers/pr_handler.py
++++ /dev/null
+@@
+diff --git a/webhooks/handlers/actions_handler.py b/webhooks/handlers/actions_handler.py
+deleted file mode 100644
+index e69de29..0000000
+--- a/webhooks/handlers/actions_handler.py
++++ /dev/null
+@@
+diff --git a/webhooks/handlers/__init__.py b/webhooks/handlers/__init__.py
+index 1111111..2222222 100644
+--- a/webhooks/handlers/__init__.py
++++ b/webhooks/handlers/__init__.py
+@@
+-def handle_issue_event(payload):
+-    ...
+-
+-def handle_pr_event(payload):
+-    ...
+-
+-def handle_actions_event(payload):
+-    ...
++# Мёртвый разбор удалён (BUG-011).
++# Единственный путь: webhooks/router.py → coding_agent.parse_webhook_event
+
+diff --git a/tests/test_pr_review_control.py b/tests/test_pr_review_control.py
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/tests/test_pr_review_control.py
+@@
++# PR-001  /diff: открыт PR → GitHub запрошен, файл отправлен, PR не изменён
++# PR-002  повторный /diff после нового commit → актуальный diff
++# PR-003  /merge при CI PASS → merge ещё не вызван, есть confirmation
++# PR-004  confirm_merge + GitHub разрешил → merge, job=DONE
++# PR-005  CI FAILURE → merge не вызывается
++# PR-006  CI running → merge не вызывается
++# PR-007  PR уже merged → повторный merge не выполняется
++# PR-008  нет PR → понятное сообщение, GitHub mutation нет
++# PR-009  ошибка Telegram send_document → состояние PR/job не меняется
++# PR-010  ошибка GitHub merge → job не DONE
++#
++# Регрессии BUG-001…007:
++#   webhook off → watch_issue доводит до финала
++#   stale timeout → warning, не terminal
++#   trigger_fix_iteration публикует "@copilot Fix the failing tests"
++#   assign без реального assignee → ADAPTER_ERROR
++#   draft=False + reviewers → AGENT_COMPLETED без текстовой эвристики
++#   copilot-pull-request-reviewer[bot] игнорируется
+
+diff --git a/docs/Detailed_Technical_Specification.md b/docs/Detailed_Technical_Specification.md
+index 1111111..2222222 100644
+--- a/docs/Detailed_Technical_Specification.md
++++ b/docs/Detailed_Technical_Specification.md
+@@
++FR: /diff выдаёт актуальный unified diff текущего PR файлом.
++FR: /merge показывает состояние и требует явное подтверждение.
++FR: перед merge повторно проверяются CI, open/merged, mergeable.
++FR-4.2: команда ровно `@copilot Fix the failing tests`.
++Логин агента: copilot-swe-agent[bot] (один, не два).
+
+diff --git a/docs/Architecture_Description.md b/docs/Architecture_Description.md
+index 1111111..2222222 100644
+--- a/docs/Architecture_Description.md
++++ b/docs/Architecture_Description.md
+@@
++Telegram → Adapter → Orchestrator → GitHubPort → GitHub Adapter → API
++watch_issue — резерв к webhook, тот же process_event / processed_event_ids
++Отдельного Telegram FSM нет. GitHub — источник истины по PR.
+
+diff --git a/docs/Acceptance_Test_Program.md b/docs/Acceptance_Test_Program.md
+index 1111111..2222222 100644
+--- a/docs/Acceptance_Test_Program.md
++++ b/docs/Acceptance_Test_Program.md
+@@
++TEST-015+ = PR-001…PR-010 (/diff, /merge, CI, идемпотентность, ошибки)
++BUG-001: webhook выключен → финал через поллинг; stale-warning без FAILED
+
+diff --git a/README.md b/README.md
+index 1111111..2222222 100644
+--- a/README.md
++++ b/README.md
+@@
++/new → Issue → Copilot → PR → Telegram (ссылка)
++     → /diff → PR-N.diff → внешнее ревью → при необходимости Copilot fixes
++     → /diff → /merge → confirmation → GitHub merge → задача завершена
++
++AI-review в MVP нет: комментарий «Pipeline check: CI passed,
++no automated review configured.»
++
++Целевой репозиторий должен содержать .github/workflows/ до делегирования
++агенту, либо агента нужно явно попросить создать минимальный CI
++(ISSUE-001, не баг пайплайна).

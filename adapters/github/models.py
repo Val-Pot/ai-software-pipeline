@@ -1,56 +1,27 @@
-"""
-GitHub REST API Pydantic response models and DTOs.
-"""
-from __future__ import annotations
-
-from datetime import datetime
-from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
 
 
 class GitHubUser(BaseModel):
     login: str
-    id: int
-    type: str = "User"
+    id: int | None = None
 
 
 class GitHubIssue(BaseModel):
-    id: int
     number: int
-    title: str
-    body: Optional[str] = None
-    state: str
     html_url: str
-    user: GitHubUser
-    labels: List[Dict[str, Any]] = Field(default_factory=list)
-    assignees: List[GitHubUser] = Field(default_factory=list)
+    title: str = ""
+    state: str = "open"
+    assignees: list[GitHubUser] = Field(default_factory=list)
 
 
 class GitHubPullRequest(BaseModel):
-    id: int
     number: int
-    title: str
-    body: Optional[str] = None
+    html_url: str
     state: str
-    html_url: str
+    draft: bool = False
+    requested_reviewers: list[GitHubUser] = Field(default_factory=list)
     merged: bool = False
-    mergeable: Optional[bool] = None
-    head_sha: Optional[str] = None
-    user: GitHubUser
-
-
-class GitHubComment(BaseModel):
-    id: int
-    body: str
-    user: GitHubUser
-    created_at: datetime
-    html_url: str
-
-
-class GitHubWorkflowRun(BaseModel):
-    id: int
-    name: str
-    status: str      # e.g., queued, in_progress, completed
-    conclusion: Optional[str] = None  # e.g., success, failure, cancelled
-    html_url: str
-    head_sha: str
+    mergeable: bool | None = None
+    mergeable_state: str | None = None
+    head_sha: str = ""
+    head_ref: str = ""

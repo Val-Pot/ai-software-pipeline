@@ -1,34 +1,94 @@
-"""
-GitHub Pull Request operations adapter.
-"""
 from __future__ import annotations
 
-import logging
-from typing import List
-from adapters.github.client import GitHubHTTPClient
-from adapters.github.models import GitHubPullRequest, GitHubComment
+import httpx
 
-logger = logging.getLogger(__name__)
+from adapters.github.models import GitHubPullRequest, GitHubUser
+from domain.errors import MergeError
 
 
-class GitHubPullRequestAdapter:
-    """Adapter for GitHub Pull Request operations."""
+class PullRequestsClient:
+    def __init__(self, http, owner: str, repo: str) -> None:
+        self._http = http
+        self._owner = owner
+        self._repo = repo
 
-    def __init__(self, client: GitHubHTTPClient) -> None:
-        self.client = client
+    async def get_pull_request(self, pull_request_number: int) -> GitHubPullRequest:
+        resp = await self._http.get(
+            f"/repos/{self._owner}/{self._repo}/pulls/{pull_request_number}"
+        )
+        data = resp.json()
+        reviewers = [
+            GitHubUser(login=item["login"], id=item.get("id"))
+            for item in (data.get("requested_reviewers") or [])
+            if item.get("login")
+        ]
+        head = data.get("head") or {}
+        return GitHubPullRequest(
+            number=data["number"],
+            html_url=data.get("html_url") or "",
+            state=data.get("state") or "open",
+            draft=bool(data.get("draft")),
+            requested_reviewers=reviewers,
+            merged=bool(data.get("merged")),
+            mergeable=data.get("mergeable"),
+            mergeable_state=data.get("mergeable_state"),
+            head_sha=(head.get("sha") or ""),
+            head_ref=(head.get("ref") or ""),
+        )
 
-    async def get_pull_request(self, pr_number: int) -> GitHubPullRequest:
-        """Read Pull Request status."""
-        res = await self.client.get(f"/pulls/{pr_number}")
-        return GitHubPullRequest.model_validate(res)
+    async def list_pulls_for_issue(self, issue_number: int) -> list[dict]:
+        resp = await self._http.get(
+            f"/repos/{self._owner}/{self._repo}/issues/{issue_number}/timeline",
+            params={"per_page": 100},
+        )
+        items = resp.json() if isinstance(resp.json(), list) else []
+        pulls: list[dict] = []
+        for item in items:
+            if item.get("event") == "cross-referenced":
+                source = (item.get("source") or {}).get("issue") or {}
+                if source.get("pull_request"):
+                    pulls.append(source)
+        if pulls:
+            return pulls
+        resp = await self._http.get(
+            f"/repos/{self._owner}/{self._repo}/pulls",
+            params={"state": "all", "per_page": 30},
+        )
+        marker = f"#{issue_number}"
+        issue_token = str(issue_number)
+        return [
+            pr
+            for pr in (resp.json() or [])
+            if marker in (pr.get("body") or "")
+            or marker in (pr.get("title") or "")
+            or issue_token in ((pr.get("head") or {}).get("ref") or "")
+        ]
 
-    async def add_pr_comment(self, pr_number: int, comment_body: str) -> GitHubComment:
-        """Publish comment to Pull Request."""
-        res = await self.client.post(f"/issues/{pr_number}/comments", {"body": comment_body})
-        logger.info("Added comment to PR #%s", pr_number)
-        return GitHubComment.model_validate(res)
+    async def get_pull_request_diff(self, pull_request_number: int) -> str:
+        resp = await self._http.get(
+            f"/repos/{self._owner}/{self._repo}/pulls/{pull_request_number}",
+            headers={"Accept": "application/vnd.github.diff"},
+        )
+        return resp.text
 
-    async def get_pr_comments(self, pr_number: int) -> List[GitHubComment]:
-        """Read comments on Pull Request."""
-        res = await self.client.get(f"/issues/{pr_number}/comments")
-        return [GitHubComment.model_validate(c) for c in res]
+    async def merge_pull_request(
+        self, pull_request_number: int, *, sha: str | None = None
+    ) -> dict:
+        payload: dict = {"merge_method": "merge"}
+        if sha:
+            payload["sha"] = sha
+        try:
+            resp = await self._http.put(
+                f"/repos/{self._owner}/{self._repo}/pulls/{pull_request_number}/merge",
+                json=payload,
+            )
+        except httpx.HTTPStatusError as exc:
+            reason = exc.response.text
+            try:
+                reason = exc.response.json().get("message") or reason
+            except Exception:
+                pass
+            raise MergeError(reason) from exc
+        except Exception as exc:
+            raise MergeError(str(exc)) from exc
+        return resp.json()

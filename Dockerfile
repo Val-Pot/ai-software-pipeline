@@ -1,68 +1,38 @@
-# ==============================================================================
-# AI Software Pipeline — Production Dockerfile
-# Python 3.12 · FastAPI · Aiogram · Multi-stage build
-# ==============================================================================
+FROM python:3.11-slim AS runtime
 
-# ---- Stage 1: dependency builder -------------------------------------------
-FROM python:3.12-slim AS builder
-
-# System packages needed to build native extensions (httpx, etc.)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential \
-        curl \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /build
-
-# Copy only requirements first — leverages Docker layer cache when code changes
-# but dependencies do not.
-COPY requirements.txt ./
-
-# Install dependencies into a dedicated prefix so we can copy them cleanly.
-RUN pip install --upgrade pip \
-    && pip install --prefix=/install --no-cache-dir -r requirements.txt
-
-
-# ---- Stage 2: production image ---------------------------------------------
-FROM python:3.12-slim AS production
-
-# Security: run as non-root user
-RUN groupadd --system pipeline && useradd --system --gid pipeline pipeline
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HOST=0.0.0.0 \
+    PORT=8080 \
+    JOBS_STORE_PATH=/app/data/jobs.json
 
 WORKDIR /app
 
-# Install curl for HEALTHCHECK probe
-RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && adduser --disabled-password --gecos "" --uid 10001 appuser \
+    && mkdir -p /app/data \
+    && chown -R appuser:appuser /app
 
-# Copy installed packages from builder stage
-COPY --from=builder /install /usr/local
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application source
-COPY --chown=pipeline:pipeline . .
+COPY --chown=appuser:appuser app ./app
+COPY --chown=appuser:appuser adapters ./adapters
+COPY --chown=appuser:appuser config ./config
+COPY --chown=appuser:appuser domain ./domain
+COPY --chown=appuser:appuser orchestrator ./orchestrator
+COPY --chown=appuser:appuser ports ./ports
+COPY --chown=appuser:appuser webhooks ./webhooks
 
-# Drop privileges
-USER pipeline
+USER appuser
 
-# Expose FastAPI port
-EXPOSE 8000
+EXPOSE 8080
 
-# Healthcheck: liveness probe via the /health endpoint
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=4)"
 
-# ---------------------------------------------------------------------------
-# Entrypoint
-#
-# uvicorn serves the FastAPI ASGI app.
-#   --host 0.0.0.0   — bind to all interfaces inside the container
-#   --port 8000      — matches EXPOSE above
-#   --workers 1      — single worker (Aiogram polling is single-process)
-#   --log-level info — structured logs captured by the Python logging config
-#   --no-access-log  — access logging handled by middleware / reverse proxy
-# ---------------------------------------------------------------------------
-CMD ["uvicorn", "app.main:app", \
-     "--host", "0.0.0.0", \
-     "--port", "8000", \
-     "--workers", "1", \
-     "--log-level", "info", \
-     "--no-access-log"]
+CMD ["python", "-m", "app.main"]

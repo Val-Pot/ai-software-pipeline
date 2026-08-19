@@ -1,102 +1,124 @@
-# AI Software Development Pipeline (MVP Prototype)
+# AI Software Pipeline
 
-Минимально жизнеспособный прототип (MVP) для валидации технической гипотезы интеграции Telegram, GitHub Copilot Coding Agent и GitHub Actions.
+Telegram control channel for GitHub Copilot coding agent.
 
----
-
-## 📌 Назначение прототипа
-
-Данный репозиторий содержит прототип системы, предназначенный исключительно для проверки возможности автоматизации передачи задач:
-
-`Telegram → GitHub Issue → GitHub Copilot Coding Agent → Pull Request → GitHub Actions CI → Telegram`
-
-Проект не является промышленной платформой и служит для оценки концепции.
-
----
-
-## 🏗 Состав компонентов
-
-Прототип включает в себя следующие компоненты:
-
-- **Telegram Bot**: Интерфейс взаимодействия с пользователем.
-- **Orchestrator**: Управление состоянием задачи и координация компонентов.
-- **GitHub Adapter**: Модуль работы с REST API GitHub и проверки HMAC-подписей вебхуков.
-- **Coding Agent Adapter**: Модуль обработки логики взаимодействия с Copilot Agent.
-- **GitHub Actions Adapter**: Обработчик статусов запусков CI.
-
----
-
-## 🚀 Запуск прототипа
-
-### 1. Подготовка `.env`
-
-Скопируйте пример файла конфигурации и заполните необходимые параметры:
-
-```bash
-cp .env.example .env
+```
+/new
+  → GitHub Issue (Task Contract template)
+  → проверка полноты контракта
+  → Copilot (только если обязательные разделы заполнены)
+  → PR
+  → Telegram: PR создан
+  → /diff → PR-N.diff → внешнее ревью
+  → при необходимости Copilot fixes → новый commit
+  → /diff → повторное ревью
+  → /merge → подтверждение
+  → GitHub merge
+  → Telegram: задача завершена
 ```
 
-Параметры:
+AI-review в MVP нет: комментарий «Pipeline check: CI passed, no automated review configured.»
 
-- `TELEGRAM_BOT_TOKEN`: Токен Telegram-бота.
-- `TELEGRAM_ALLOWED_USER_IDS`: Список авторизованных Telegram ID.
-- `GITHUB_TOKEN`: Персональный токен GitHub.
-- `GITHUB_OWNER`: Имя владельца репозитория.
-- `GITHUB_REPO`: Имя репозитория.
-- `GITHUB_WEBHOOK_SECRET`: Секретный ключ HMAC вебхуков.
-- `GITHUB_CI_WORKFLOW_NAME`: (опционально) имя workflow GitHub Actions, которое считается CI. Пустое значение — любой success/failure.
+Целевой репозиторий должен содержать `.github/workflows/` до делегирования агенту, либо агента нужно явно попросить создать минимальный CI (ISSUE-001, не баг пайплайна).
 
-### 2. GitHub webhook
+## What it does
 
-Репозиторий должен слать webhook на публичный URL сервиса:
+1. Authorized user sends `/new <task>` in Telegram.
+2. Pipeline opens a GitHub Issue with a Task Contract template. Copilot is assigned only if required sections are non-empty.
+3. GitHub webhooks **and** `watch_issue` polling feed the same `process_event()` path. `issues.edited` re-checks the contract while the job is still `TASK_ACCEPTED`.
+4. When a PR exists, `/diff` sends the live unified diff as `PR-{n}.diff`.
+5. `/merge` shows CI/PR status and merges only after an explicit button press.
 
-`POST https://<host>:8000/webhooks/github`
+Telegram never calls the GitHub API. GitHub remains the source of truth.
 
-Обязательные настройки:
+## Requirements
 
-- **Content type:** `application/json`
-- **Secret:** тот же, что `GITHUB_WEBHOOK_SECRET`
-- **Events:** `pull_request`, `workflow_run`, `issue_comment`
+- Python 3.11+
+- Telegram bot token
+- GitHub token that can create issues, assign Copilot, read PRs, merge, and (for backup poll) read Actions
+- Copilot coding agent enabled on the **target** repository
+- CI workflows in the target repository (or ask the agent to add them)
 
-Локально нужен туннель (ngrok, Cloudflare Tunnel и т.п.) на порт `8000`. События `issues` / `label` пайплайн игнорирует — их недостаточно.
+Fine-grained PAT: Repository permissions **Actions: Read**, **Contents: Read**, **Issues: Write**, **Pull requests: Write**. Without Actions: Read the bot still works via webhook; it will not poll `/actions/runs`.
 
-Если webhook не дойдёт (туннель упал, секрет не совпал, GitHub не достучался), пайплайн больше не зависает молча на «Coding Agent Running»: фоновый опрос issue (`watch_issue`) подхватывает PR (в том числе уже смерженный), вопросы Copilot и закрытие issue. Таймаут `CODING_AGENT_WATCHER_TIMEOUT` (по умолчанию 1 час) считается от последнего события, не от старта задачи. Если новостей нет дольше этого интервала, бот пришлёт сообщение в Telegram.
-
-### 3. Запуск через Docker Compose
+## Setup
 
 ```bash
-docker compose up --build
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements-dev.txt
+copy .env.example .env
 ```
 
-Сервис будет доступен на порту `8000`.
+Fill `.env`:
 
----
+| Variable | Meaning |
+| --- | --- |
+| `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather |
+| `TELEGRAM_ALLOWED_USER_IDS` | Comma-separated Telegram user IDs. Empty list denies everyone. |
+| `GITHUB_TOKEN` | Fine-grained or classic PAT |
+| `GITHUB_OWNER` / `GITHUB_REPO` | Target repository |
+| `GITHUB_WEBHOOK_SECRET` | Secret for `POST /webhooks/github` |
+| `COPILOT_USERNAME` | `copilot-swe-agent[bot]` |
+| `JOBS_STORE_PATH` | JSON file for jobs + processed event IDs. Empty = in-memory only. |
 
-## 📡 Эндпоинты
+Point a GitHub webhook at `https://<host>/webhooks/github` for `issues`, `issue_comment`, `pull_request`, `workflow_run`. Polling still works if the webhook is missing. `issues.edited` re-checks a Task Contract that is still waiting to start.
 
-- `GET /health` — Liveness проверка работы сервера.
-- `GET /health/ready` — Readiness проверка готовности компонентов.
-- `POST /webhooks/github` — Приём вебхуков от GitHub.
-- `POST /telegram/webhook` — Приём обновлений Telegram (в режиме webhook).
+```bash
+python -m app.main
+```
 
----
+## Docker
 
-## ⚠️ Известные ограничения MVP
+Secrets stay in `.env` (not baked into the image). Job state survives container restarts via the `pipeline-data` volume.
 
-Данный прототип реализует минимальный сценарий для проверки гипотезы интеграции. Следующие возможности намеренно исключены из области MVP:
+```bash
+copy .env.example .env
+docker compose up -d --build
+```
 
-- **Один репозиторий**: Система поддерживает работу только с одним целевым репозиторием GitHub, заданным в конфигурации.
-- **Без мульти-агентной поддержки**: Поддерживается взаимодействие только с одним AI-агентом (`github-copilot[bot]`). Параллельная работа нескольких агентов не предусмотрена.
-- **Без базы знаний**: Система не использует и не поддерживает подключение к базе знаний (Knowledge Base) для контекстуализации задач.
-- **Без LangGraph**: Граф агентов (LangGraph) не используется. Оркестрация реализована через простой конечный автомат.
-- **Без RAG**: Retrieval-Augmented Generation не используется. Агент не получает дополнительный контекст из документов или векторных хранилищ.
-- **Без распределённого выполнения**: Система выполняется в одном контейнере. Распределённая обработка, очереди сообщений и масштабирование не предусмотрены.
-- **AI-ревью опционально**: Этап AI-ревью кода является необязательным и может отсутствовать в зависимости от конфигурации.
+Webhook URL: `https://<host>/webhooks/github`. Health: `GET /health`.
 
----
+```bash
+docker compose logs -f
+docker compose down
+```
 
-## 📚 Документация
+To run the image without Compose:
 
-- [Detailed_Technical_Specification.md](Detailed_Technical_Specification.md) — Техническое задание MVP (требования).
-- [Architecture_Description.md](Architecture_Description.md) — Описание архитектуры компонентов MVP.
-- [Acceptance_Test_Program.md](Acceptance_Test_Program.md) — Программа и методика приемочных испытаний (TEST-001 — TEST-014).
+```bash
+docker build -t ai-software-pipeline .
+docker run --rm -p 8080:8080 --env-file .env -v pipeline-data:/app/data ai-software-pipeline
+```
+
+## Commands
+
+| Command | Effect |
+| --- | --- |
+| `/new <text>` | Create Issue with Task Contract; assign Copilot if required sections are filled |
+| `/new` | Empty: create an empty-template Issue, or re-check the current `TASK_ACCEPTED` Issue |
+| `/diff` | Live unified diff of the current job PR as `PR-{n}.diff`. A PR number is rejected. |
+| `/merge` | Status + Merge/Cancel for the current job PR. `/merge 123` is rejected. Confirm re-checks the allowlist. |
+| `/status` | Current job state |
+
+## Tests
+
+```bash
+pytest
+```
+
+Covers BUG-001…009, PIPE-PR-001 (`TEST-015+`, PR-001…PR-028), and Task Contract gate (V1–V7).
+
+## Layout
+
+```
+adapters/     GitHub, Telegram, coding agent, file/in-memory jobs
+orchestrator/ Job FSM, watchers, /diff, /merge
+ports/        Protocols — Telegram does not import GitHub
+webhooks/     Signature check → parse_webhook_event
+docs/         TZ, architecture, acceptance program
+```
+
+## Spec sources
+
+`AI-PIPELINE-PR-FIXES.txt` and `AI-PIPELINE-PR-FIXES.diff` in the repo root are the defect TZ (BUG-001…011) and PIPE-PR-001 (`/diff`, `/merge`) this tree implements.
