@@ -297,6 +297,39 @@ async def test_detect_pull_request_from_merged_pr_list(
 
 
 @pytest.mark.asyncio
+async def test_detect_pull_request_from_timeline(
+    adapter: CodingAgentAdapter, mock_client: MagicMock
+) -> None:
+    adapter._issues.get_comments = AsyncMock(return_value=[])
+
+    async def fake_get(endpoint: str, params: dict | None = None):
+        if str(endpoint).endswith("/timeline"):
+            return [
+                {
+                    "event": "cross-referenced",
+                    "source": {
+                        "issue": {
+                            "number": 14,
+                            "html_url": "https://github.com/owner/repo/pull/14",
+                            "pull_request": {
+                                "html_url": "https://github.com/owner/repo/pull/14",
+                            },
+                        }
+                    },
+                }
+            ]
+        return []
+
+    mock_client.get = AsyncMock(side_effect=fake_get)
+
+    event = await adapter.detect_pull_request(issue_number=6)
+
+    assert event is not None
+    assert event.pr_number == 14
+    assert event.pr_url == "https://github.com/owner/repo/pull/14"
+
+
+@pytest.mark.asyncio
 async def test_detect_pull_request_not_found(
     adapter: CodingAgentAdapter, mock_client: MagicMock
 ) -> None:
@@ -560,6 +593,46 @@ async def test_watch_issue_detects_pr_after_question(adapter: CodingAgentAdapter
     assert AgentEventType.COPILOT_QUESTION in seen
     assert AgentEventType.PR_CREATED in seen
     adapter.detect_pull_request.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_watch_issue_detects_pr_without_agent_start_comment(adapter: CodingAgentAdapter) -> None:
+    pr = CodingAgentEvent(
+        event_type=AgentEventType.PR_CREATED,
+        issue_number=6,
+        pr_number=12,
+        pr_url="https://github.com/owner/repo/pull/12",
+        message="pr",
+    )
+    adapter.detect_agent_start = AsyncMock(return_value=None)
+    adapter.detect_copilot_question = AsyncMock(return_value=None)
+    adapter.detect_pull_request = AsyncMock(return_value=pr)
+    adapter.detect_task_completion = AsyncMock(return_value=None)
+
+    seen: list[AgentEventType] = []
+    async for event in adapter.watch_issue(6, timeout=1.0):
+        seen.append(event.event_type)
+        if event.event_type == AgentEventType.PR_CREATED:
+            break
+
+    assert seen == [AgentEventType.PR_CREATED]
+
+
+@pytest.mark.asyncio
+async def test_watch_issue_detects_closed_issue_without_agent_start(adapter: CodingAgentAdapter) -> None:
+    done = CodingAgentEvent(
+        event_type=AgentEventType.AGENT_COMPLETED,
+        issue_number=6,
+        message="closed",
+    )
+    adapter.detect_agent_start = AsyncMock(return_value=None)
+    adapter.detect_copilot_question = AsyncMock(return_value=None)
+    adapter.detect_pull_request = AsyncMock(return_value=None)
+    adapter.detect_task_completion = AsyncMock(return_value=done)
+
+    events = [event async for event in adapter.watch_issue(6, timeout=1.0)]
+
+    assert events[0].event_type == AgentEventType.AGENT_COMPLETED
 
 
 @pytest.mark.asyncio

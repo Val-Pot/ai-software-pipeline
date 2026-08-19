@@ -406,12 +406,14 @@ class CodingAgentAdapter:
         """
         logger.debug("Checking for PR creation linked to issue #%d", issue_number)
 
-        # Strategy 1: Scan issue comments for a PR link posted by the bot.
         pr_event = await self._detect_pr_from_comments(issue_number, job_id)
         if pr_event:
             return pr_event
 
-        # Strategy 2: List open PRs and match by title/body pattern referencing the issue.
+        pr_event = await self._detect_pr_from_timeline(issue_number, job_id)
+        if pr_event:
+            return pr_event
+
         pr_event = await self._detect_pr_from_pr_list(issue_number, job_id)
         return pr_event
 
@@ -634,7 +636,14 @@ class CodingAgentAdapter:
                             self._watcher_activity[issue_number] = last_activity
                             yield start_event
 
-                    if status in (AgentStatus.RUNNING, AgentStatus.WAITING_REPLY):
+                    # Copilot often opens a PR without commenting on the issue.
+                    # Do not wait for AGENT_STARTED — otherwise the watcher
+                    # stays ASSIGNED until idle timeout while GitHub emails fire.
+                    if status in (
+                        AgentStatus.ASSIGNED,
+                        AgentStatus.RUNNING,
+                        AgentStatus.WAITING_REPLY,
+                    ):
                         q_event = await self.detect_copilot_question(
                             issue_number, job_id, last_comment_id
                         )
@@ -645,7 +654,11 @@ class CodingAgentAdapter:
                             self._watcher_activity[issue_number] = last_activity
                             yield q_event
 
-                    if status in (AgentStatus.RUNNING, AgentStatus.WAITING_REPLY):
+                    if status in (
+                        AgentStatus.ASSIGNED,
+                        AgentStatus.RUNNING,
+                        AgentStatus.WAITING_REPLY,
+                    ):
                         pr_event = await self.detect_pull_request(issue_number, job_id)
                         if pr_event:
                             status = AgentStatus.PR_OPEN
@@ -654,6 +667,7 @@ class CodingAgentAdapter:
                             yield pr_event
 
                     if status in (
+                        AgentStatus.ASSIGNED,
                         AgentStatus.RUNNING,
                         AgentStatus.PR_OPEN,
                         AgentStatus.WAITING_REPLY,
@@ -793,8 +807,6 @@ class CodingAgentAdapter:
         )
         comments = await self._fetch_comments(issue_number)
         for comment in comments:
-            if not self._is_copilot_comment(comment):
-                continue
             match = pr_url_pattern.search(comment.body)
             if match:
                 pr_number = int(match.group(1))
@@ -817,6 +829,64 @@ class CodingAgentAdapter:
                 )
         return None
 
+    async def _detect_pr_from_timeline(
+        self,
+        issue_number: int,
+        job_id: Optional[str],
+    ) -> Optional[CodingAgentEvent]:
+        """Use the issue timeline — GitHub records a cross-reference when a PR mentions the issue."""
+        try:
+            async for attempt in _make_retry_policy(self._max_retries, 1, 10):
+                with attempt:
+                    events: list = await self._client.get(  # type: ignore[assignment]
+                        f"/issues/{issue_number}/timeline",
+                        params={"per_page": 100},
+                    )
+        except (GitHubClientError, RetryError) as exc:
+            logger.warning("Could not fetch timeline for issue #%d: %s", issue_number, exc)
+            return None
+
+        if not isinstance(events, list):
+            return None
+
+        for event in reversed(events):
+            if not isinstance(event, dict):
+                continue
+            if event.get("event") not in {"cross-referenced", "connected", "referenced"}:
+                continue
+            source_issue = (event.get("source") or {}).get("issue") or {}
+            pull = source_issue.get("pull_request")
+            html_url = source_issue.get("html_url") or ""
+            if not pull and "/pull/" not in str(html_url):
+                continue
+            pr_url = ""
+            if isinstance(pull, dict):
+                pr_url = pull.get("html_url") or html_url
+            else:
+                pr_url = html_url
+            pr_number = source_issue.get("number")
+            if not pr_url or not pr_number:
+                match = re.search(r"/pull/(\d+)", str(pr_url))
+                if not match:
+                    continue
+                pr_number = int(match.group(1))
+                pr_url = pr_url or match.group(0)
+            logger.info(
+                "PR #%s detected via timeline on issue #%d",
+                pr_number,
+                issue_number,
+            )
+            return CodingAgentEvent(
+                event_type=AgentEventType.PR_CREATED,
+                job_id=job_id,
+                issue_number=issue_number,
+                pr_number=int(pr_number),
+                pr_url=str(pr_url),
+                agent_username=self._copilot_username,
+                message=f"PR #{pr_number} is linked to issue #{issue_number}.",
+            )
+        return None
+
     async def _detect_pr_from_pr_list(
         self,
         issue_number: int,
@@ -832,7 +902,7 @@ class CodingAgentAdapter:
                             "state": "all",
                             "sort": "updated",
                             "direction": "desc",
-                            "per_page": 30,
+                            "per_page": 100,
                         },
                     )
         except (GitHubClientError, RetryError) as exc:
@@ -845,32 +915,29 @@ class CodingAgentAdapter:
         ]
 
         for pr_data in prs_data:
-            # Only consider PRs opened by the Copilot bot.
-            user_login: str = pr_data.get("user", {}).get("login", "").lower()
-            if "copilot" not in user_login and user_login != self._copilot_username.lower():
-                continue
-
             body: str = pr_data.get("body") or ""
             title: str = pr_data.get("title") or ""
             combined = f"{title}\n{body}"
 
-            if any(p.search(combined) for p in issue_ref_patterns):
-                pr_number = pr_data["number"]
-                pr_url = pr_data["html_url"]
-                logger.info(
-                    "PR #%d matched issue #%d via PR list scan",
-                    pr_number,
-                    issue_number,
-                )
-                return CodingAgentEvent(
-                    event_type=AgentEventType.PR_CREATED,
-                    job_id=job_id,
-                    issue_number=issue_number,
-                    pr_number=pr_number,
-                    pr_url=pr_url,
-                    agent_username=self._copilot_username,
-                    message=f"Copilot agent created PR #{pr_number} referencing issue #{issue_number}.",
-                )
+            if not any(p.search(combined) for p in issue_ref_patterns):
+                continue
+
+            pr_number = pr_data["number"]
+            pr_url = pr_data["html_url"]
+            logger.info(
+                "PR #%d matched issue #%d via PR list scan",
+                pr_number,
+                issue_number,
+            )
+            return CodingAgentEvent(
+                event_type=AgentEventType.PR_CREATED,
+                job_id=job_id,
+                issue_number=issue_number,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                agent_username=self._copilot_username,
+                message=f"PR #{pr_number} references issue #{issue_number}.",
+            )
         return None
 
     # ------------------------------------------------------------------
